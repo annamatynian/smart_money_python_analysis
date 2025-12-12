@@ -856,3 +856,131 @@ class SpoofingAnalyzer:
             score += 0.3
         
         return min(1.0, score)
+
+
+# ===========================================================================
+# НОВЫЙ КЛАСС: AccumulationDetector (Task 3.2 - Multi-Timeframe Context)
+# ===========================================================================
+
+class AccumulationDetector:
+    """
+    WHY: Детектор накопления/дистрибуции для свинг-трейдинга.
+    
+    Теория (документ "Smart Money Analysis", раздел 3.2):
+    - Накопление = Whale CVD растет, пока цена падает (BULLISH divergence)
+    - Дистрибуция = Whale CVD падает, пока цена растет (BEARISH divergence)
+    - Корреляция с айсберг-зонами усиливает сигнал
+    
+    Использует:
+    - LocalOrderBook.historical_memory для CVD дивергенции
+    - LocalOrderBook.cluster_icebergs_to_zones() для корреляции
+    """
+    
+    def __init__(self, book: LocalOrderBook):
+        """
+        Args:
+            book: LocalOrderBook с historical_memory и active_icebergs
+        """
+        self.book = book
+    
+    def detect_accumulation(self, timeframe: str = '1h') -> Optional[dict]:
+        """
+        WHY: Детектирует накопление/дистрибуцию на заданном таймфрейме.
+        
+        Логика:
+        1. Проверяем CVD дивергенцию через historical_memory
+        2. Если дивергенция есть → проверяем близость к айсберг-зонам
+        3. Рассчитываем confidence (базовая + бонус за зону)
+        
+        Args:
+            timeframe: '1h', '4h', '1d', или '1w'
+        
+        Returns:
+            dict с полями:
+            - type: 'BULLISH' | 'BEARISH'
+            - timeframe: str
+            - confidence: float (0.0-1.0)
+            - near_strong_zone: bool
+            - zone_price: Optional[Decimal] (цена ближайшей зоны)
+            
+            Или None если дивергенции нет
+        """
+        # 1. Проверяем дивергенцию
+        is_divergence, div_type = self.book.historical_memory.detect_cvd_divergence(timeframe)
+        
+        if not is_divergence:
+            return None
+        
+        # 2. Базовая confidence зависит от таймфрейма
+        # Старшие таймфреймы = выше confidence
+        base_confidence = {
+            '1h': 0.5,
+            '4h': 0.6,
+            '1d': 0.7,
+            '1w': 0.8
+        }.get(timeframe, 0.5)
+        
+        # 3. Проверяем корреляцию с айсберг-зонами
+        zones = self.book.cluster_icebergs_to_zones()
+        current_price = self.book.get_mid_price()
+        
+        # WHY: Если стакан пустой → корреляция с зонами невозможна (нет текущей цены)
+        # В production это не происходит (стакан всегда заполнен)
+        
+        near_strong_zone = False
+        zone_price = None
+        
+        if current_price and zones:
+            # Ищем ближайшую сильную зону (подходящего типа)
+            # BULLISH дивергенция → ищем BID зоны (поддержка)
+            # BEARISH дивергенция → ищем ASK зоны (сопротивление)
+            is_ask_zone = (div_type == 'BEARISH')
+            
+            relevant_zones = [z for z in zones if z.is_ask == is_ask_zone and z.is_strong()]
+            
+            if relevant_zones:
+                # Находим ближайшую зону
+                closest_zone = min(relevant_zones, 
+                                 key=lambda z: abs(float(z.center_price - current_price)))
+                
+                distance_pct = abs(float(closest_zone.center_price - current_price) / float(current_price)) * 100
+                
+                # Если расстояние < 0.5% → считаем что рядом
+                if distance_pct < 0.5:
+                    near_strong_zone = True
+                    zone_price = closest_zone.center_price
+                    # Бонус к confidence +0.2
+                    base_confidence = min(1.0, base_confidence + 0.2)
+        
+        return {
+            'type': div_type,
+            'timeframe': timeframe,
+            'confidence': base_confidence,
+            'near_strong_zone': near_strong_zone,
+            'zone_price': zone_price
+        }
+    
+    def detect_accumulation_multi_timeframe(self) -> dict:
+        """
+        WHY: Анализ на всех таймфреймах одновременно.
+        
+        Логика:
+        - Проверяем 1H, 4H, 1D, 1W
+        - Возвращаем только те таймфреймы, где есть дивергенция
+        
+        Returns:
+            dict: {
+                '1h': {...},  # Результат detect_accumulation
+                '4h': {...},
+                # и т.д. (только таймфреймы с дивергенцией)
+            }
+        """
+        timeframes = ['1h', '4h', '1d', '1w']
+        results = {}
+        
+        for tf in timeframes:
+            result = self.detect_accumulation(timeframe=tf)
+            if result is not None:
+                results[tf] = result
+        
+        return results

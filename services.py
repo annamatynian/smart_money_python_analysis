@@ -2,7 +2,7 @@ import asyncio
 from decimal import Decimal
 from domain import LocalOrderBook, TradeEvent, OrderBookUpdate, GapDetectedError
 from infrastructure import IMarketDataSource, ReorderingBuffer, LatencyMonitor
-from analyzers import IcebergAnalyzer, WhaleAnalyzer
+from analyzers import IcebergAnalyzer, WhaleAnalyzer, AccumulationDetector
 from datetime import datetime
 # WHY: Импорт функции загрузки config для мульти-токен поддержки
 from config import get_config
@@ -36,6 +36,10 @@ class TradingEngine:
         config = get_config(symbol)
         self.iceberg_analyzer = IcebergAnalyzer(config)
         self.whale_analyzer = WhaleAnalyzer(config)
+        
+        # === НОВОЕ: AccumulationDetector для свинг-трейдинга (Phase 3.2) ===
+        # WHY: Автоматическая детекция накопления/дистрибуции на мульти-таймфреймах
+        self.accumulation_detector = AccumulationDetector(self.book)
         
         # Очереди для событий (Producer-Consumer pattern)
         self.depth_queue = asyncio.Queue()

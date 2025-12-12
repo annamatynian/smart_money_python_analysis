@@ -142,6 +142,213 @@ class IcebergLevel(BaseModel):
         lifetime_minutes = lifetime_seconds / 60.0
         return self.refill_count / lifetime_minutes if lifetime_minutes > 0 else 0.0
 
+
+# ===========================================================================
+# НОВЫЙ КЛАСС: PriceZone (Task 3.2 - Context Multi-Timeframe)
+# ===========================================================================
+
+class PriceZone(BaseModel):
+    """
+    WHY: Кластеризация айсбергов на близких уровнях в единую зону.
+    
+    Теория (документ "Smart Money Analysis", раздел 3.2):
+    - Айсберги на уровнях 95000, 95050, 95100 (<0.2% разница) = одна зона
+    - Зона с 3+ айсбергами = "сильная зона" (институциональный интерес)
+    - Используется для свинг-трейдинга: вход у зон, стоп за зонами
+    
+    Алгоритм кластеризации:
+    1. Сортируем айсберги по цене
+    2. Если разница между соседними < tolerance_pct → объединяем
+    3. Вычисляем центр зоны (средняя цена), total_volume (сумма)
+    """
+    center_price: Decimal  # Средняя цена зоны (взвешенная по объёму)
+    is_ask: bool  # True = сопротивление, False = поддержка
+    total_volume: Decimal  # Суммарный скрытый объём всех айсбергов
+    iceberg_count: int  # Количество айсбергов в зоне
+    price_range: Tuple[Decimal, Decimal]  # (min_price, max_price)
+    
+    # Список айсбергов в зоне (для детального анализа)
+    icebergs: List[IcebergLevel] = Field(default_factory=list)
+    
+    # Метаданные
+    creation_time: datetime = Field(default_factory=datetime.now)
+    
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    
+    def is_strong(self, min_count: int = 3) -> bool:
+        """
+        WHY: Зона с 3+ айсбергами = "сильная зона".
+        
+        Сильные зоны имеют:
+        - Больше институционального интереса
+        - Выше вероятность отбоя цены
+        - Подходят для свинг-трейдинга (вход у зоны)
+        
+        Args:
+            min_count: Минимальное количество айсбергов (default 3)
+        
+        Returns:
+            True если зона сильная
+        """
+        return self.iceberg_count >= min_count
+    
+    def get_width_pct(self) -> float:
+        """
+        WHY: Ширина зоны в процентах.
+        
+        Узкие зоны (<0.1%) = точечная поддержка/сопротивление
+        Широкие зоны (>0.5%) = размытая защита
+        
+        Returns:
+            Ширина в процентах от центральной цены
+        """
+        min_p, max_p = self.price_range
+        width = float(max_p - min_p)
+        return (width / float(self.center_price)) * 100.0
+
+
+# ===========================================================================
+# НОВЫЙ КЛАСС: HistoricalMemory (Task 3.2 - Multi-Timeframe Context)
+# ===========================================================================
+
+class HistoricalMemory(BaseModel):
+    """
+    WHY: Хранилище исторических данных для свинг-трейдинга.
+    
+    Теория (документ "Smart Money Analysis", раздел 3.2):
+    - Свинг-трейдинг требует контекста на нескольких таймфреймах
+    - CVD дивергенция (whale CVD ↑ while price ↓) = накопление
+    - Работает на 1H/4H/1D/1W таймфреймах
+    
+    Таймфреймы:
+    - 1H (60 мин): Краткосрочное накопление, точка входа
+    - 4H (240 мин): Основной свинг-таймфрейм (тренд)
+    - 1D (1440 мин): Среднесрочное позиционирование
+    - 1W (10080 мин): Долгосрочный контекст (мажоры vs свинг)
+    """
+    
+    # История Whale CVD
+    cvd_history_1h: deque = Field(default_factory=lambda: deque(maxlen=60))   # 60 часов
+    cvd_history_4h: deque = Field(default_factory=lambda: deque(maxlen=168))  # 4 недели (168 = 4*24/4 * 7)
+    cvd_history_1d: deque = Field(default_factory=lambda: deque(maxlen=30))   # 30 дней
+    cvd_history_1w: deque = Field(default_factory=lambda: deque(maxlen=52))   # 52 недели (год)
+    
+    # История цены (mid_price)
+    price_history_1h: deque = Field(default_factory=lambda: deque(maxlen=60))
+    price_history_4h: deque = Field(default_factory=lambda: deque(maxlen=168))
+    price_history_1d: deque = Field(default_factory=lambda: deque(maxlen=30))
+    price_history_1w: deque = Field(default_factory=lambda: deque(maxlen=52))
+    
+    # Метаданные для downsampling
+    last_update_1h: Optional[datetime] = None
+    last_update_4h: Optional[datetime] = None
+    last_update_1d: Optional[datetime] = None
+    last_update_1w: Optional[datetime] = None
+    
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    
+    def update_history(self, timestamp: datetime, whale_cvd: float, price: Decimal):
+        """
+        WHY: Добавляет новую точку данных и агрегирует в старшие таймфреймы.
+        
+        Логика:
+        1. Всегда добавляем в 1H (самый мелкий таймфрейм)
+        2. Если прошло 4+ часа → агрегируем в 4H
+        3. Если прошло 24+ часа → агрегируем в 1D
+        4. Если прошло 168+ часов (неделя) → агрегируем в 1W
+        
+        Args:
+            timestamp: Время события
+            whale_cvd: Whale CVD в этот момент
+            price: Mid price в этот момент
+        """
+        # 1. Всегда добавляем в 1H
+        self.cvd_history_1h.append((timestamp, whale_cvd))
+        self.price_history_1h.append((timestamp, price))
+        
+        # WHY: Инициализируем last_update при первом вызове (но НЕ добавляем в старшие таймфреймы)
+        if self.last_update_1h is None:
+            self.last_update_1h = timestamp
+            self.last_update_4h = timestamp
+            self.last_update_1d = timestamp
+            self.last_update_1w = timestamp
+            return  # Первая точка - только инициализация
+        
+        self.last_update_1h = timestamp
+        
+        # 2. Downsample в 4H (если прошло 4+ часа)
+        if (timestamp - self.last_update_4h).total_seconds() >= 4 * 3600:
+            self.cvd_history_4h.append((timestamp, whale_cvd))
+            self.price_history_4h.append((timestamp, price))
+            self.last_update_4h = timestamp
+        
+        # 3. Downsample в 1D (если прошло 24+ часа)
+        if (timestamp - self.last_update_1d).total_seconds() >= 24 * 3600:
+            self.cvd_history_1d.append((timestamp, whale_cvd))
+            self.price_history_1d.append((timestamp, price))
+            self.last_update_1d = timestamp
+        
+        # 4. Downsample в 1W (если прошло 168+ часов)
+        if (timestamp - self.last_update_1w).total_seconds() >= 168 * 3600:
+            self.cvd_history_1w.append((timestamp, whale_cvd))
+            self.price_history_1w.append((timestamp, price))
+            self.last_update_1w = timestamp
+    
+    def detect_cvd_divergence(self, timeframe: str = '1h') -> Tuple[bool, Optional[str]]:
+        """
+        WHY: Детектирует CVD дивергенцию (накопление/дистрибуция).
+        
+        Логика (из документа "Smart Money Analysis"):
+        - БЫЧЬЯ дивергенция: Цена делает Lower Low, CVD делает Higher Low
+          → Киты накапливают (покупают на падении)
+        - МЕДВЕЖЬЯ дивергенция: Цена делает Higher High, CVD делает Lower High
+          → Киты дистрибутируют (продают на росте)
+        
+        Args:
+            timeframe: '1h', '4h', '1d', или '1w'
+        
+        Returns:
+            (is_divergence: bool, divergence_type: 'BULLISH' | 'BEARISH' | None)
+        """
+        # Выбираем нужный таймфрейм
+        if timeframe == '1h':
+            cvd_hist = self.cvd_history_1h
+            price_hist = self.price_history_1h
+        elif timeframe == '4h':
+            cvd_hist = self.cvd_history_4h
+            price_hist = self.price_history_4h
+        elif timeframe == '1d':
+            cvd_hist = self.cvd_history_1d
+            price_hist = self.price_history_1d
+        elif timeframe == '1w':
+            cvd_hist = self.cvd_history_1w
+            price_hist = self.price_history_1w
+        else:
+            return False, None
+        
+        # Нужно минимум 3 точки для дивергенции
+        if len(cvd_hist) < 3 or len(price_hist) < 3:
+            return False, None
+        
+        # Берем последние 3 точки
+        recent_cvds = list(cvd_hist)[-3:]
+        recent_prices = list(price_hist)[-3:]
+        
+        # Извлекаем значения
+        cvd_values = [c[1] for c in recent_cvds]
+        price_values = [float(p[1]) for p in recent_prices]
+        
+        # Проверяем БЫЧЬЮ дивергенцию (Lower Low price, Higher Low CVD)
+        if price_values[-1] < price_values[0] and cvd_values[-1] > cvd_values[0]:
+            return True, 'BULLISH'
+        
+        # Проверяем МЕДВЕЖЬЮ дивергенцию (Higher High price, Lower High CVD)
+        if price_values[-1] > price_values[0] and cvd_values[-1] < cvd_values[0]:
+            return True, 'BEARISH'
+        
+        return False, None
+
+
 # --- Entity ---
 
 class LocalOrderBook(BaseModel):
@@ -178,6 +385,9 @@ class LocalOrderBook(BaseModel):
     trade_count: int = 0
     algo_window: deque = Field(default_factory=deque)
     
+    # WHY: Историческая память для свинг-трейдинга (Task 3.2 - Multi-Timeframe Context)
+    historical_memory: HistoricalMemory = Field(default_factory=HistoricalMemory)
+    
     # WHY: Расширенная детекция алгоритмов (Task: Advanced Algo Detection)
     # История интервалов между сделками для анализа σ_Δt (TWAP vs VWAP)
     algo_interval_history: deque = Field(default_factory=lambda: deque(maxlen=200))
@@ -199,8 +409,10 @@ class LocalOrderBook(BaseModel):
     # === НОВЫЕ ПОЛЯ ДЛЯ OFI (Task: OFI Implementation) ===
     # WHY: Хранение предыдущего состояния для расчета Order Flow Imbalance
     # Храним только топ-20 уровней для экономии памяти
-    previous_bid_snapshot: Optional[Dict[Decimal, Decimal]] = Field(default=None)
-    previous_ask_snapshot: Optional[Dict[Decimal, Decimal]] = Field(default=None)
+    # === OPTIMIZATION (Task: Double Buffering - Gemini Phase 2.1) ===
+    # Pre-allocated буферы для переиспользования (избегаем 2000 аллокаций/сек)
+    previous_bid_snapshot: Dict[Decimal, Decimal] = Field(default_factory=dict)
+    previous_ask_snapshot: Dict[Decimal, Decimal] = Field(default_factory=dict)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -228,8 +440,9 @@ class LocalOrderBook(BaseModel):
         # WHY: CRITICAL FIX (Task: Reconnect Bug Fix) - Gemini Phase 1.1
         # При reconnect сбрасываем старое состояние OFI
         # Иначе calculate_ofi() будет сравнивать новый стакан со старым (до разрыва)
-        self.previous_bid_snapshot = None
-        self.previous_ask_snapshot = None
+        # === DOUBLE BUFFERING: Используем clear() вместо = None ===
+        self.previous_bid_snapshot.clear()
+        self.previous_ask_snapshot.clear()
         
         # Сохраняем новое начальное состояние
         self._save_book_snapshot()
@@ -417,6 +630,95 @@ class LocalOrderBook(BaseModel):
         self.active_icebergs[price] = new_lvl
         return new_lvl
 
+    def cluster_icebergs_to_zones(self, tolerance_pct: float = 0.002) -> List[PriceZone]:
+        """
+        WHY: Кластеризация айсбергов в зоны (Task 3.2).
+        
+        Алгоритм:
+        1. Разделяем bid/ask айсберги
+        2. Сортируем по цене
+        3. Группируем соседние уровни с разницей < tolerance_pct
+        4. Создаем PriceZone для каждой группы
+        
+        Args:
+            tolerance_pct: Максимальная разница цен для объединения (default 0.2%)
+        
+        Returns:
+            List[PriceZone]: Список зон (bid + ask)
+        """
+        zones = []
+        
+        # Фильтруем только активные айсберги
+        active = [lvl for lvl in self.active_icebergs.values() 
+                  if lvl.status == IcebergStatus.ACTIVE]
+        
+        if not active:
+            return zones
+        
+        # Разделяем на bid/ask
+        bid_icebergs = sorted([lvl for lvl in active if not lvl.is_ask], 
+                             key=lambda x: x.price)
+        ask_icebergs = sorted([lvl for lvl in active if lvl.is_ask], 
+                             key=lambda x: x.price)
+        
+        # Кластеризуем каждую сторону
+        for is_ask, icebergs in [(False, bid_icebergs), (True, ask_icebergs)]:
+            if not icebergs:
+                continue
+            
+            # Начинаем первый кластер
+            current_cluster = [icebergs[0]]
+            
+            for i in range(1, len(icebergs)):
+                prev_price = icebergs[i-1].price
+                curr_price = icebergs[i].price
+                
+                # Проверяем близость
+                price_diff_pct = float(abs(curr_price - prev_price) / prev_price)
+                
+                if price_diff_pct <= tolerance_pct:
+                    # Добавляем в текущий кластер
+                    current_cluster.append(icebergs[i])
+                else:
+                    # Создаем зону из текущего кластера
+                    zones.append(self._create_zone_from_cluster(current_cluster, is_ask))
+                    # Начинаем новый кластер
+                    current_cluster = [icebergs[i]]
+            
+            # Не забываем последний кластер
+            if current_cluster:
+                zones.append(self._create_zone_from_cluster(current_cluster, is_ask))
+        
+        return zones
+    
+    def _create_zone_from_cluster(self, cluster: List[IcebergLevel], is_ask: bool) -> PriceZone:
+        """
+        WHY: Вспомогательный метод для создания PriceZone из кластера айсбергов.
+        
+        Вычисляет:
+        - Взвешенную среднюю цену (weighted by volume)
+        - Суммарный объем
+        - Диапазон цен
+        """
+        total_vol = sum(lvl.total_hidden_volume for lvl in cluster)
+        
+        # Взвешенная средняя цена
+        weighted_sum = sum(lvl.price * lvl.total_hidden_volume for lvl in cluster)
+        center_price = weighted_sum / total_vol if total_vol > 0 else cluster[0].price
+        
+        # Диапазон
+        prices = [lvl.price for lvl in cluster]
+        price_range = (min(prices), max(prices))
+        
+        return PriceZone(
+            center_price=center_price,
+            is_ask=is_ask,
+            total_volume=total_vol,
+            iceberg_count=len(cluster),
+            price_range=price_range,
+            icebergs=cluster
+        )
+
     def check_breaches(self, current_trade_price: Decimal) -> List[IcebergLevel]:
         """
         Проверяет пробой айсберг-уровней.
@@ -600,8 +902,11 @@ class LocalOrderBook(BaseModel):
         # peekitem(-1) = последний (лучший bid)
         # peekitem(0) = первый (лучший ask)
         
+        # === DOUBLE BUFFERING: Очищаем буферы вместо создания новых ===
+        self.previous_bid_snapshot.clear()  # ✅ Переиспользование памяти
+        self.previous_ask_snapshot.clear()  # ✅ Нет новой аллокации!
+        
         # Сохраняем топ-N бидов (самые дорогие)
-        self.previous_bid_snapshot = {}
         n_bids = min(depth, len(self.bids))
         for i in range(n_bids):
             # peekitem(-1) = best, peekitem(-2) = 2nd best, ...
@@ -609,7 +914,6 @@ class LocalOrderBook(BaseModel):
             self.previous_bid_snapshot[price] = qty
         
         # Сохраняем топ-N асков (самые дешевые)
-        self.previous_ask_snapshot = {}
         n_asks = min(depth, len(self.asks))
         for i in range(n_asks):
             # peekitem(0) = best, peekitem(1) = 2nd best, ...
@@ -641,7 +945,8 @@ class LocalOrderBook(BaseModel):
         if depth is None:
             depth = self.config.ofi_depth
         # Если это первый update - нет предыдущего состояния
-        if self.previous_bid_snapshot is None or self.previous_ask_snapshot is None:
+        # === DOUBLE BUFFERING: Буферы всегда dict, проверяем пустые ===
+        if not self.previous_bid_snapshot or not self.previous_ask_snapshot:
             return 0.0
         
         delta_bid_volume = 0.0
@@ -779,6 +1084,96 @@ class LocalOrderBook(BaseModel):
         obi = (bid_vol_weighted - ask_vol_weighted) / total_weighted_vol
         
         return obi
+    
+    # ===================================================================
+    # CVD DIVERGENCE DETECTION (Decision Layer - Critical Tag)
+    # ===================================================================
+    
+    def detect_cvd_divergence(
+        self,
+        price_history: List[float],
+        cvd_history: List[float],
+        min_points: int = 3,
+        timeframe_min: Tuple[float, float] = (1.0, 60.0)
+    ) -> Tuple[bool, Optional[str], float]:
+        """
+        WHY: Детектирует дивергенцию между ценой и Whale CVD.
+        
+        Теория (документ "Smart Money Analysis", раздел 3.1):
+        - Bullish Divergence: Цена делает Lower Low, CVD делает Higher Low
+        - Bearish Divergence: Цена делает Higher High, CVD делает Lower High
+        - Это CONTRARIAN SIGNAL - показывает скрытую аккумуляцию/дистрибуцию
+        
+        Args:
+            price_history: Список цен (минимум 3 точки)
+            cvd_history: Список Whale CVD значений (синхронизирован с ценами)
+            min_points: Минимальное количество точек для детекции (default 3)
+            timeframe_min: (min, max) временной фрейм в минутах для валидной дивергенции
+        
+        Returns:
+            Tuple[is_divergence, divergence_type, confidence]
+            - is_divergence: True если дивергенция обнаружена
+            - divergence_type: 'BULLISH' | 'BEARISH' | None
+            - confidence: 0.0-1.0 (сила дивергенции)
+        
+        Examples:
+            >>> # Bullish Divergence (цена падает, CVD растёт)
+            >>> prices = [100000, 99000, 98500]  # Lower Lows
+            >>> cvds = [-10000, -5000, -2000]    # Higher Lows (киты покупают)
+            >>> is_div, div_type, conf = book.detect_cvd_divergence(prices, cvds)
+            >>> assert is_div == True
+            >>> assert div_type == 'BULLISH'
+        """
+        # 1. Валидация входных данных
+        if len(price_history) < min_points or len(cvd_history) < min_points:
+            return False, None, 0.0
+        
+        if len(price_history) != len(cvd_history):
+            return False, None, 0.0
+        
+        # 2. Проверяем что достаточно данных для анализа
+        n = len(price_history)
+        if n < 3:
+            return False, None, 0.0
+        
+        # 3. Определяем направление ЦЕНЫ (используем первую и последнюю точки)
+        price_start = price_history[0]
+        price_end = price_history[-1]
+        price_change_pct = ((price_end - price_start) / price_start) * 100.0
+        
+        # 4. Определяем направление CVD
+        cvd_start = cvd_history[0]
+        cvd_end = cvd_history[-1]
+        cvd_change = cvd_end - cvd_start
+        
+        # 5. Проверяем наличие дивергенции
+        is_divergence = False
+        divergence_type = None
+        confidence = 0.0
+        
+        # BULLISH DIVERGENCE: Цена падает (Lower Lows), CVD растёт (Higher Lows)
+        # Признак: Киты покупают на падении (аккумуляция)
+        if price_change_pct < -0.5 and cvd_change > 0:  # Цена упала >0.5%, CVD вырос
+            is_divergence = True
+            divergence_type = 'BULLISH'
+            
+            # Confidence = сила расхождения
+            # Чем больше цена упала И чем больше CVD вырос → выше confidence
+            price_strength = abs(price_change_pct) / 5.0  # Нормализуем к 5% падению
+            cvd_strength = abs(cvd_change) / 50000.0     # Нормализуем к $50k CVD
+            confidence = min(1.0, (price_strength + cvd_strength) / 2.0)
+        
+        # BEARISH DIVERGENCE: Цена растёт (Higher Highs), CVD падает (Lower Highs)
+        # Признак: Киты продают в рост (дистрибуция)
+        elif price_change_pct > 0.5 and cvd_change < 0:  # Цена выросла >0.5%, CVD упал
+            is_divergence = True
+            divergence_type = 'BEARISH'
+            
+            price_strength = abs(price_change_pct) / 5.0
+            cvd_strength = abs(cvd_change) / 50000.0
+            confidence = min(1.0, (price_strength + cvd_strength) / 2.0)
+        
+        return is_divergence, divergence_type, confidence
 
 
 # ===========================================================================
