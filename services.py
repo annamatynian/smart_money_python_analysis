@@ -1,7 +1,7 @@
 import asyncio
 from decimal import Decimal
 from domain import LocalOrderBook, TradeEvent, OrderBookUpdate, GapDetectedError
-from infrastructure import IMarketDataSource, ReorderingBuffer
+from infrastructure import IMarketDataSource, ReorderingBuffer, LatencyMonitor
 from analyzers import IcebergAnalyzer, WhaleAnalyzer
 from datetime import datetime
 # WHY: Импорт функции загрузки config для мульти-токен поддержки
@@ -41,7 +41,15 @@ class TradingEngine:
         self.depth_queue = asyncio.Queue()
         self.trade_queue = asyncio.Queue()
 
-        self.buffer = ReorderingBuffer(delay_ms=50)
+        # === НОВОЕ: Adaptive Delay (Task: Gemini Phase 2.1) ===
+        # WHY: Мониторинг задержек для адаптивной синхронизации потоков
+        self.latency_monitor = LatencyMonitor(
+            window_size=100,  # 100 последних событий
+            k=3.0,            # 99.7% покрытие (правило 3 сигм)
+            base_processing_ms=10.0  # Binance processing time
+        )
+        
+        self.buffer = ReorderingBuffer(delay_ms=50)  # Начальное значение
         
         # Флаг инициализации
         self.is_initialized = False
@@ -140,11 +148,23 @@ class TradingEngine:
     async def _produce_depth(self):
         """Producer: Читает сокет стакана и кладет в очередь"""
         async for update in self.infra.listen_updates(self.symbol):
+            # === НОВОЕ: Записываем задержку ===
+            import time
+            arrival_time_ms = time.time() * 1000
+            event_time_ms = int(update.event_time.timestamp() * 1000)
+            self.latency_monitor.record_latency(event_time_ms, arrival_time_ms)
+            
             await self.depth_queue.put(update)
 
     async def _produce_trades(self):
         """Producer: Читает сокет сделок и кладет в очередь"""
         async for trade in self.infra.listen_trades(self.symbol):
+            # === НОВОЕ: Записываем задержку ===
+            import time
+            arrival_time_ms = time.time() * 1000
+            event_time_ms = trade.event_time
+            self.latency_monitor.record_latency(event_time_ms, arrival_time_ms)
+            
             await self.trade_queue.put(trade)
 
     async def _consume_and_analyze(self):
@@ -154,9 +174,26 @@ class TradingEngine:
         """
         print("🛡️ Reordering Buffer activated. Starting analysis...")
         
+        iteration_count = 0  # Для периодического обновления delay
+        
         while True:
-            # 1. Ждем 50 мс, собирая данные (Micro-Batching)
-            await asyncio.sleep(0.05) 
+            # === НОВОЕ: Adaptive Delay ===
+            # WHY: Динамически обновляем задержку каждые 100 итераций
+            iteration_count += 1
+            if iteration_count % 100 == 0:
+                adaptive_delay_ms = self.latency_monitor.get_adaptive_delay()
+                self.buffer.delay_sec = adaptive_delay_ms / 1000.0
+                
+                # Отладочный вывод (каждые 1000 итераций)
+                if iteration_count % 1000 == 0:
+                    stats = self.latency_monitor.get_stats()
+                    print(f"📊 Latency Stats: RTT={stats['mean_rtt']:.1f}ms, "
+                          f"Jitter={stats['stdev_jitter']:.1f}ms, "
+                          f"Adaptive Delay={stats['adaptive_delay']:.1f}ms")
+            
+            # 1. Ждем с адаптивной задержкой (Micro-Batching)
+            current_delay_sec = self.buffer.delay_sec
+            await asyncio.sleep(current_delay_sec) 
             
             # 2. Забираем Сделки (Priority 0 - Высший, так как они имеют точный timestamp)
             while not self.trade_queue.empty():

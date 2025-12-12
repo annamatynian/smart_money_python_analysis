@@ -13,6 +13,108 @@ from abc import ABC, abstractmethod
 import time
 from heapq import heappush, heappop
 from typing import List, Tuple, Any
+from collections import deque
+import statistics
+
+
+class LatencyMonitor:
+    """
+    WHY: Мониторинг задержек сети для адаптивной синхронизации потоков.
+    
+    Отслеживает:
+    - RTT (Round-Trip Time): Разница между event_time и arrival_time
+    - Джиттер (σ_jit): Стандартное отклонение задержек
+    
+    Формула адаптивной задержки (из документации):
+    T_GU(t) = μ_RTT(t) + μ_proc(t) + k · σ_jit(t)
+    
+    Где:
+    - μ_RTT: среднее RTT
+    - μ_proc: среднее время обработки биржи (~5-10ms для Binance)
+    - k: коэффициент уверенности (3 для 99.7% покрытия)
+    - σ_jit: стандартное отклонение (джиттер)
+    """
+    
+    def __init__(self, window_size: int = 100, k: float = 3.0, base_processing_ms: float = 10.0):
+        """
+        Args:
+            window_size: Размер скользящего окна для расчета статистики
+            k: Коэффициент для σ (правило трёх сигм = 3.0)
+            base_processing_ms: Базовое время обработки биржи (Binance ~10ms)
+        """
+        self.window_size = window_size
+        self.k = k
+        self.base_processing_ms = base_processing_ms
+        
+        # Скользящее окно задержек (в миллисекундах)
+        self.latencies = deque(maxlen=window_size)
+        
+        # Минимальная задержка (защита от нуля)
+        self.min_delay_ms = 10.0
+        self.max_delay_ms = 500.0  # Защита от аномально высоких значений
+    
+    def record_latency(self, event_time_ms: int, arrival_time_ms: float):
+        """
+        Записывает задержку между временем события и временем прибытия.
+        
+        Args:
+            event_time_ms: Время события от биржи (в миллисекундах)
+            arrival_time_ms: Локальное время прибытия (time.time() * 1000)
+        """
+        # RTT = arrival_time - event_time (может быть отрицательным если часы рассинхронены)
+        latency_ms = abs(arrival_time_ms - event_time_ms)
+        
+        # Фильтруем аномальные значения (>5 секунд = явная рассинхронизация часов)
+        if latency_ms < 5000:
+            self.latencies.append(latency_ms)
+    
+    def get_adaptive_delay(self) -> float:
+        """
+        Вычисляет адаптивную задержку по формуле:
+        T_GU = μ_RTT + μ_proc + k · σ_jit
+        
+        Returns:
+            Рекомендуемая задержка в миллисекундах
+        """
+        if len(self.latencies) < 10:  # Недостаточно данных
+            return 50.0  # Возвращаем дефолтное значение
+        
+        # Расчет статистики
+        mean_rtt = statistics.mean(self.latencies)
+        stdev_jitter = statistics.stdev(self.latencies) if len(self.latencies) > 1 else 0.0
+        
+        # Формула адаптивной задержки
+        adaptive_delay = mean_rtt + self.base_processing_ms + (self.k * stdev_jitter)
+        
+        # Ограничиваем диапазон
+        adaptive_delay = max(self.min_delay_ms, min(adaptive_delay, self.max_delay_ms))
+        
+        return adaptive_delay
+    
+    def get_stats(self) -> dict:
+        """
+        Возвращает текущую статистику для отладки.
+        
+        Returns:
+            Dict с ключами: mean_rtt, stdev_jitter, adaptive_delay, sample_size
+        """
+        if len(self.latencies) < 2:
+            return {
+                'mean_rtt': 0.0,
+                'stdev_jitter': 0.0,
+                'adaptive_delay': 50.0,
+                'sample_size': len(self.latencies)
+            }
+        
+        mean_rtt = statistics.mean(self.latencies)
+        stdev_jitter = statistics.stdev(self.latencies)
+        
+        return {
+            'mean_rtt': round(mean_rtt, 2),
+            'stdev_jitter': round(stdev_jitter, 2),
+            'adaptive_delay': round(self.get_adaptive_delay(), 2),
+            'sample_size': len(self.latencies)
+        }
 
 
 class ReorderingBuffer:
