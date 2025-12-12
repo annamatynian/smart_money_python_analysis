@@ -53,6 +53,9 @@ class TradingEngine:
         
         # Флаг инициализации
         self.is_initialized = False
+        
+        # === FUSION LOGIC: Price tracking for Absorption detection ===
+        self._last_mid_price = None  # Используется для расчёта price_change
 
     async def run(self):
         """
@@ -80,6 +83,10 @@ class TradingEngine:
         # --- НОВАЯ ЗАДАЧА: GEX MONITOR ---
         if self.deribit:
             tasks_to_gather.append(asyncio.create_task(self._produce_gex()))
+        
+        # --- НОВАЯ ЗАДАЧА: PERIODIC CLEANUP (Memory Management) ---
+        # WHY: Удаляет старые айсберги каждые 5 минут (вместо счётчика сделок)
+        tasks_to_gather.append(asyncio.create_task(self._periodic_cleanup_task()))
         
         await self._initialize_book()
         
@@ -284,12 +291,7 @@ class TradingEngine:
                     for lvl in breached_levels:
                         self._print_breakout_alert(lvl, trade.price)
 
-                    # 2. Очистка памяти
-                    # Раз в 100 сделок удаляем старые/неактуальные уровни
-                    if self.book.trade_count % 100 == 0:
-                        self.book.cleanup_old_levels()
-                    
-                    # 3. Whale Analyzer & Algo Detection
+                    # 2. Whale Analyzer & Algo Detection
                     # Возвращает 3 значения: категория, объем в $, и флаг алгоритма
                     # WHY: Используем экземпляр анализатора с config (адаптирован под токен)
                     category, vol_usd, algo_alert = self.whale_analyzer.update_stats(self.book, trade)
@@ -333,6 +335,29 @@ class TradingEngine:
     
                     # 3. Cleanup old entries (> 100ms ago)
                     self._cleanup_pending_checks(current_time_ms=trade.event_time)
+                    
+                    # === FUSION LOGIC (OFI + Absorption) ===
+                    # WHY: Вычисляем OFI и проверяем сценарий Absorption (Gemini Phase 3.1)
+                    ofi_value = self.book.calculate_ofi()  # НОВОЕ: Вызов OFI
+                    
+                    # Сценарий Absorption: OFI > 0 но цена не растёт → Sell Iceberg
+                    # (Будет логироваться в ML для обучения моделей)
+                    current_mid = self.book.get_mid_price()
+                    absorption_detected = False
+                    
+                    # Проверяем только если есть история цены
+                    if hasattr(self, '_last_mid_price') and self._last_mid_price:
+                        price_change_pct = abs(float(current_mid - self._last_mid_price) / float(self._last_mid_price)) * 100.0
+                        
+                        # Absorption: OFI положительный + цена стабильна (< 0.01%)
+                        if ofi_value > 0 and price_change_pct < 0.01:
+                            absorption_detected = True
+                            # Debug вывод (раз в 100 сделок чтобы не спамить)
+                            if self.book.trade_count % 100 == 0:
+                                print(f"\n💧 ABSORPTION DETECTED! OFI={ofi_value:.2f}, Price Change={price_change_pct:.4f}%")
+                    
+                    # Сохраняем текущую цену для следующей итерации
+                    self._last_mid_price = current_mid
                     
                     # === ML LOGIC ===
                     # Определяем, сохранять ли данные (Крупная сделка > 0.1 BTC ИЛИ есть активный айсберг)
@@ -392,6 +417,22 @@ class TradingEngine:
                             print(f"❌ [ERROR] Exception in ML LOGIC block: {e}")
                             import traceback
                             traceback.print_exc()
+                    
+                    # === MARKET METRICS LOGGING (Gemini Phase 3.2) ===
+                    # WHY: Логируем метрики OFI/OBI для ML-моделей (каждые 10 сделок)
+                    if self.repository and (self.book.trade_count % 10 == 0):
+                        try:
+                            await self.repository.log_market_metrics(
+                                symbol=self.symbol,
+                                timestamp=datetime.now(),
+                                mid_price=current_mid,
+                                ofi=ofi_value,
+                                obi=curr_obi if 'curr_obi' in locals() else self.book.get_weighted_obi(use_exponential=True),
+                                spread_bps=self.book.get_spread()
+                            )
+                            # Note: absorption_detected не логируется отдельно (можно добавить колонку в БД позже)
+                        except Exception as e:
+                            print(f"❌ [ERROR] log_market_metrics failed: {e}")
                     
                     # === КОНЕЦ ML LOGIC ==="
                   
@@ -501,6 +542,13 @@ class TradingEngine:
             last_update_id=snapshot['lastUpdateId']
         )
         
+        # === НОВОЕ: Reconcile icebergs after resync (Critical Bug Fix - Gemini 2.2) ===
+        # WHY: Удаляет "ghost" айсберги, которые исчезли во время disconnect
+        self.book.reconcile_with_snapshot(
+            bids=snapshot['bids'],
+            asks=snapshot['asks']
+        )
+        
         await self._apply_buffered_updates()
         self.is_initialized = True
         print("✅ Resync completed")
@@ -575,3 +623,42 @@ class TradingEngine:
             return self.book.asks.get(price, Decimal("0"))
         else:
             return self.book.bids.get(price, Decimal("0"))
+    
+    async def _periodic_cleanup_task(self, interval_seconds: int = 300):
+        """
+        WHY: Периодическая очистка старых айсбергов (Memory Management)
+        
+        Запускается каждые interval_seconds (default 5 минут).
+        Удаляет айсберги старше 1 часа и пробитые айсберги старше 5 минут.
+        
+        Преимущества таймера vs счётчика сделок:
+        - Предсказуемое потребление памяти
+        - Не зависит от волатильности (1000 сделок/сек vs 10 сделок/мин)
+        - Меньше нагрузки на CPU (не вызывается на каждой 100-й сделке)
+        
+        Args:
+            interval_seconds: Интервал между очистками (default 300с = 5 мин)
+        """
+        print(f"🧹 Cleanup task started (interval: {interval_seconds}s)")
+        
+        while True:
+            try:
+                # Wait for interval
+                await asyncio.sleep(interval_seconds)
+                
+                # Cleanup old icebergs (TTL = 1 hour = 3600 seconds)
+                before_count = len(self.book.active_icebergs)
+                self.book.cleanup_old_levels(seconds=3600)
+                after_count = len(self.book.active_icebergs)
+                
+                removed_count = before_count - after_count
+                if removed_count > 0:
+                    print(f"🧹 Cleanup: Removed {removed_count} old icebergs ({after_count} remaining)")
+                
+            except asyncio.CancelledError:
+                print("🧹 Cleanup task cancelled")
+                break
+            except Exception as e:
+                print(f"❌ Cleanup task error: {e}")
+                # Continue running despite errors
+                continue

@@ -446,6 +446,88 @@ class LocalOrderBook(BaseModel):
                 
         return breached
     
+    def reconcile_with_snapshot(self, bids: List[Tuple[Decimal, Decimal]], asks: List[Tuple[Decimal, Decimal]]):
+        """
+        WHY: Reconcile icebergs after snapshot resync (Critical Bug Fix - Gemini 2.2)
+        
+        После WebSocket reconnect и resync проверяет, какие айсберги больше не существуют
+        в новом снапшоте и помечает их как CANCELLED (ghost icebergs).
+        
+        Scenario:
+        1. Before resync: Iceberg at 60000 BID
+        2. Network disconnect → iceberg cancelled by trader during disconnect
+        3. After resync: Snapshot has no liquidity at 60000
+        4. This method: Marks iceberg as CANCELLED (not ACTIVE)
+        
+        Args:
+            bids: New snapshot bids [(price, qty), ...]
+            asks: New snapshot asks [(price, qty), ...]
+        """
+        # WHY: Convert snapshot to dict for O(1) lookup
+        snapshot_bid_prices = {price for price, qty in bids if qty > self.config.dust_threshold}
+        snapshot_ask_prices = {price for price, qty in asks if qty > self.config.dust_threshold}
+        
+        # WHY: Iterate through active icebergs and check if they still exist
+        for price, iceberg in self.active_icebergs.items():
+            # Skip already invalidated icebergs
+            if iceberg.status != IcebergStatus.ACTIVE:
+                continue
+            
+            # Check BID icebergs
+            if not iceberg.is_ask:
+                # If price not in snapshot OR volume is dust → mark as CANCELLED
+                if price not in snapshot_bid_prices:
+                    iceberg.status = IcebergStatus.CANCELLED
+                    iceberg.last_update_time = datetime.now()
+                    
+                    # WHY: Store cancellation context for spoofing analysis
+                    mid = self.get_mid_price()
+                    if mid:
+                        distance_pct = abs((mid - price) / price * 100)
+                        iceberg.cancellation_context = CancellationContext(
+                            mid_price_at_cancel=mid,
+                            distance_from_level_pct=distance_pct,
+                            price_velocity_5s=Decimal("0"),  # Not tracked here
+                            moving_towards_level=False,
+                            volume_executed_pct=Decimal("0")  # Unknown after resync
+                        )
+            
+            # Check ASK icebergs
+            else:
+                if price not in snapshot_ask_prices:
+                    iceberg.status = IcebergStatus.CANCELLED
+                    iceberg.last_update_time = datetime.now()
+                    
+                    # Store context
+                    mid = self.get_mid_price()
+                    if mid:
+                        distance_pct = abs((price - mid) / price * 100)
+                        iceberg.cancellation_context = CancellationContext(
+                            mid_price_at_cancel=mid,
+                            distance_from_level_pct=distance_pct,
+                            price_velocity_5s=Decimal("0"),
+                            moving_towards_level=False,
+                            volume_executed_pct=Decimal("0")
+                        )
+    
+    def get_iceberg_at_price(self, price: Decimal, is_ask: bool) -> Optional[IcebergLevel]:
+        """
+        WHY: Helper method to retrieve iceberg at specific price and side.
+        
+        Used by reconciliation and tests to verify iceberg state.
+        
+        Args:
+            price: Price level to check
+            is_ask: True for ASK iceberg, False for BID
+        
+        Returns:
+            IcebergLevel if exists, None otherwise
+        """
+        iceberg = self.active_icebergs.get(price)
+        if iceberg and iceberg.is_ask == is_ask:
+            return iceberg
+        return None
+
     def cleanup_old_levels(self, seconds=3600):
         """Удаляет старые уровни (TTL), чтобы не засорять память [cite: 541]"""
         now = datetime.now()
@@ -732,3 +814,60 @@ class AlgoDetectionMetrics:
     # Классификация
     algo_type: Optional[str] = None  # 'TWAP', 'VWAP', 'ICEBERG', 'SWEEP', None
     confidence: float = 0.0  # 0.0-1.0
+
+
+# ===========================================================================
+# DECISION LAYER: Quality Tags for Swing Trading Signals
+# ===========================================================================
+
+@dataclass
+class IcebergQualityTags:
+    """
+    WHY: Enriches iceberg detection with actionable intelligence for swing trading.
+    
+    Теория (документ "Smart Money Analysis", разделы 2.1-2.3):
+    - Не все айсберги равны: мелкие HFT-алгоритмы vs крупные институционалы
+    - Контекст имеет значение: совпадение с Gamma Walls повышает вероятность удержания уровня
+    - Временные характеристики: долгоживущие айсберги (>5 мин) = позиционные игроки
+    
+    Categories:
+    1. Size Tags: WHALE, SHARK, INSTITUTIONAL_BLOCK
+    2. Context Tags: GAMMA_SUPPORT, OFI_CONFIRMED, CVD_DIVERGENCE
+    3. Time Tags: PERSISTENT, FLASH
+    4. Quality Metrics: Win Rate, Absorbed Volume Ratio
+    """
+    
+    # --- SIZE CLASSIFICATION ---
+    is_whale: bool = False  # Volume > $100k or 95th percentile
+    is_shark: bool = False  # Volume $10k-$100k
+    is_institutional_block: bool = False  # Uniform size pattern (algo signature)
+    
+    # --- MARKET CONTEXT ---
+    gamma_support: bool = False  # Coincides with high GEX Put Wall
+    gamma_resistance: bool = False  # Coincides with high GEX Call Wall
+    ofi_confirmed: bool = False  # OFI aligns with hidden volume direction
+    cvd_divergence: bool = False  # Price vs Whale CVD divergence (contrarian signal)
+    
+    # --- TEMPORAL CHARACTERISTICS ---
+    is_persistent: bool = False  # Lifetime > 5 minutes (positional player)
+    is_flash: bool = False  # Lifetime < 1 second (HFT/Spoofing)
+    
+    # --- QUALITY METRICS ---
+    absorbed_volume_ratio: float = 0.0  # V_total_exec / V_visible (раздел 4.1)
+    iceberg_win_rate: Optional[float] = None  # Historical bounce probability at this level
+    distance_to_gamma_wall_bps: Optional[float] = None  # Distance to nearest GEX level (basis points)
+    
+    # --- META ---
+    confidence_score: float = 0.0  # 0.0-1.0: aggregated quality score
+    recommended_action: Optional[str] = None  # 'BUY', 'SELL', 'HOLD', 'AVOID'
+    
+    def get_tag_summary(self) -> str:
+        """Returns emoji-rich human-readable summary of tags."""
+        tags = []
+        if self.is_whale: tags.append("🐳WHALE")
+        if self.is_shark: tags.append("🦈SHARK")
+        if self.gamma_support: tags.append("🛡️GAMMA_SUPPORT")
+        if self.ofi_confirmed: tags.append("✅OFI_CONFIRMED")
+        if self.cvd_divergence: tags.append("🔀CVD_DIVERGENCE")
+        if self.is_persistent: tags.append("⏳PERSISTENT")
+        return " ".join(tags) if tags else "NO_TAGS"
