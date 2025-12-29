@@ -15,10 +15,12 @@ async def main():
     infra = BinanceInfrastructure()
     deribit = DeribitInfrastructure()
 
-    # --- БАЗА ДАННЫХ ---
-    dsn = "postgresql://postgres:password@localhost:5432/trading_db" # ⚠️ ЗАМЕНИ НА СВОЙ ПАРОЛЬ
-    repo = PostgresRepository(dsn)
-    await repo.connect()
+    # --- БАЗА ДАННЫХ (ОТКЛЮЧЕНО ДЛЯ ТЕСТИРОВАНИЯ) ---
+    # dsn = "postgresql://postgres:Jayaasiri2185@localhost:5432/trading_db"
+    # repo = PostgresRepository(dsn)
+    # await repo.connect()
+    # await repo.run_migrations()  # Применяем миграции (lifecycle + features)
+    repo = None  # Запускаем без БД
     # -------------------
     
     # Создаем Мозг (TradingEngine), который связывает Стакан, Аналитику и Данные

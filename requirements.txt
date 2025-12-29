@@ -1,24 +1,44 @@
-# Core Dependencies
+# ============================================
+# Smart Money Python Analysis - Dependencies
+# ARM64 Compatible (Oracle Cloud)
+# ============================================
+
+# === Core Application ===
 pydantic>=2.0.0
-psycopg2-binary>=2.9.0
 python-dotenv>=1.0.0
 
-# Async & WebSocket
+# === Database (PostgreSQL + TimescaleDB) ===
+asyncpg>=0.29.0
+# WHY: Async PostgreSQL driver (must-have для asyncio)
+psycopg2-binary>=2.9.0
+# WHY: Sync PostgreSQL driver (для миграций)
+
+# === Async & WebSocket ===
 aiohttp>=3.9.0
 websockets>=12.0
 
-# Data Processing
+# === Data Processing ===
 pandas>=2.0.0
 numpy>=1.24.0
 
-# Testing
+# === HTTP Clients ===
+requests>=2.31.0
+
+# === Testing ===
 pytest>=7.4.0
 pytest-asyncio>=0.21.0
 pytest-cov>=4.1.0
 pytest-mock>=3.11.0
 
-# API Clients
-requests>=2.31.0
+# === Utilities ===
+# decimal - standard library (no install needed)
+# sortedcontainers - для SortedDict в domain.py (опционально)
+sortedcontainers>=2.4.0
 
-# Decimal Precision (built-in, but noting for documentation)
-# decimal - standard library
+# ============================================
+# PRODUCTION NOTES:
+# ============================================
+# 1. asyncpg компилируется из C-кода - требует gcc на ARM64
+# 2. psycopg2-binary уже скомпилирован (no gcc needed)
+# 3. Все пакеты совместимы с ARM64 (протестировано на Oracle Cloud)
+# ============================================

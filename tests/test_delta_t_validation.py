@@ -11,6 +11,7 @@ from datetime import datetime
 from domain import LocalOrderBook, TradeEvent, IcebergLevel
 from analyzers import IcebergAnalyzer
 from events import IcebergDetectedEvent
+from config import BTC_CONFIG  # WHY: IcebergAnalyzer теперь требует config
 
 
 class TestDeltaTValidation:
@@ -18,7 +19,8 @@ class TestDeltaTValidation:
     
     def setup_method(self):
         """Setup test fixtures"""
-        self.book = LocalOrderBook(symbol="BTCUSDT")
+        self.book = LocalOrderBook(symbol="BTCUSDT", config=BTC_CONFIG)
+        self.analyzer = IcebergAnalyzer(config=BTC_CONFIG)  # WHY: Создаём экземпляр
         
         # Create a realistic trade event
         self.trade = TradeEvent(
@@ -39,7 +41,7 @@ class TestDeltaTValidation:
         delta_t_ms = 15  # 15ms - typical refill time
         update_time_ms = self.trade.event_time + delta_t_ms
         
-        result = IcebergAnalyzer.analyze_with_timing(
+        result = self.analyzer.analyze_with_timing(
             book=self.book,
             trade=self.trade,
             visible_before=self.visible_before,
@@ -61,7 +63,7 @@ class TestDeltaTValidation:
         delta_t_ms = 75  # 75ms - too slow for refill
         update_time_ms = self.trade.event_time + delta_t_ms
         
-        result = IcebergAnalyzer.analyze_with_timing(
+        result = self.analyzer.analyze_with_timing(
             book=self.book,
             trade=self.trade,
             visible_before=self.visible_before,
@@ -79,7 +81,7 @@ class TestDeltaTValidation:
         delta_t_ms = 50  # Exactly at cutoff
         update_time_ms = self.trade.event_time + delta_t_ms
         
-        result = IcebergAnalyzer.analyze_with_timing(
+        result = self.analyzer.analyze_with_timing(
             book=self.book,
             trade=self.trade,
             visible_before=self.visible_before,
@@ -101,7 +103,7 @@ class TestDeltaTValidation:
         delta_t_ms = -10  # Update arrived 10ms before trade
         update_time_ms = self.trade.event_time + delta_t_ms
         
-        result = IcebergAnalyzer.analyze_with_timing(
+        result = self.analyzer.analyze_with_timing(
             book=self.book,
             trade=self.trade,
             visible_before=self.visible_before,
@@ -130,7 +132,7 @@ class TestDeltaTValidation:
         delta_t_ms = 10  # Perfect timing
         update_time_ms = small_trade.event_time + delta_t_ms
         
-        result = IcebergAnalyzer.analyze_with_timing(
+        result = self.analyzer.analyze_with_timing(
             book=self.book,
             trade=small_trade,
             visible_before=visible,
@@ -147,7 +149,7 @@ class TestDeltaTValidation:
         compared to perfect timing (5-15ms).
         """
         # Perfect timing
-        result_fast = IcebergAnalyzer.analyze_with_timing(
+        result_fast = self.analyzer.analyze_with_timing(
             book=self.book,
             trade=self.trade,
             visible_before=self.visible_before,
@@ -156,7 +158,7 @@ class TestDeltaTValidation:
         )
         
         # Marginal timing
-        result_slow = IcebergAnalyzer.analyze_with_timing(
+        result_slow = self.analyzer.analyze_with_timing(
             book=self.book,
             trade=self.trade,
             visible_before=self.visible_before,

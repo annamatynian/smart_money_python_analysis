@@ -61,3 +61,4 @@ Thumbs.db
 
 # Documentation (временные файлы)
 *.md.backup
+  # Security - API keys and secrets  *secret*  *key*.txt  *password*  credentials.json  config_local.py  # Debug files  debug_*.py  validate_*.py 

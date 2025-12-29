@@ -60,6 +60,7 @@ async def test_accumulation_detector_integration():
         engine.book.historical_memory.update_history(
             timestamp=base_time + timedelta(hours=i),
             whale_cvd=engine.book.whale_cvd['whale'],
+            minnow_cvd=-engine.book.whale_cvd['whale'] * 0.3,  # WHY: Minnow противоположен whale
             price=trade.price
         )
     
@@ -126,6 +127,7 @@ async def test_gex_correlation_in_engine():
         engine.book.historical_memory.update_history(
             timestamp=base_time + timedelta(hours=i),
             whale_cvd=whale_cvd,
+            minnow_cvd=-whale_cvd * 0.5,  # WHY: Паника продавцов (противоположен whale)
             price=price
         )
     

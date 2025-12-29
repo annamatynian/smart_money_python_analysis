@@ -6,15 +6,12 @@
 -- ИЗМЕНЕНИЯ В ТАБЛИЦЕ iceberg_levels
 -- ============================================================================
 
--- 1. Добавляем новый статус CANCELLED
-ALTER TYPE iceberg_status ADD VALUE IF NOT EXISTS 'CANCELLED';
-
--- 2. Добавляем поля для антиспуфинга
+-- 1. Добавляем поля для антиспуфинга
 ALTER TABLE iceberg_levels 
 ADD COLUMN IF NOT EXISTS spoofing_probability DOUBLE PRECISION DEFAULT 0.0,
 ADD COLUMN IF NOT EXISTS refill_count INTEGER DEFAULT 0;
 
--- 3. Создаем таблицу для хранения контекста отмены
+-- 2. Создаем таблицу для хранения контекста отмены
 CREATE TABLE IF NOT EXISTS iceberg_cancellation_context (
     price NUMERIC PRIMARY KEY REFERENCES iceberg_levels(price) ON DELETE CASCADE,
     mid_price_at_cancel NUMERIC NOT NULL,
@@ -25,7 +22,7 @@ CREATE TABLE IF NOT EXISTS iceberg_cancellation_context (
     cancelled_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 4. Создаем индексы для оптимизации запросов
+-- 3. Создаем индексы для оптимизации запросов
 CREATE INDEX IF NOT EXISTS idx_spoofing_prob 
 ON iceberg_levels(spoofing_probability DESC) 
 WHERE spoofing_probability > 0.7;

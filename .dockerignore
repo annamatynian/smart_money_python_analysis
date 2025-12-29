@@ -1,0 +1,94 @@
+# ============================================
+# .dockerignore - исключаем из Docker build context
+# WHY: Ускоряет сборку + уменьшает размер образа
+# ============================================
+
+# === Python cache и виртуальные окружения ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# === Testing ===
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+.hypothesis/
+tests/__pycache__/
+
+# === IDE и редакторы ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# === Git ===
+.git/
+.gitignore
+.gitattributes
+
+# === Docker ===
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# === CI/CD ===
+.github/
+.gitlab-ci.yml
+Jenkinsfile
+
+# === Документация ===
+*.md
+docs/
+README*
+ML_TRAINING_ROADMAP.md
+
+# === Logs и данные (локальные) ===
+logs/
+*.log
+pg_data/
+*.db
+*.sqlite
+
+# === Конфигурация (используем env vars) ===
+.env
+.env.local
+.env.production
+*.env
+
+# === Временные файлы ===
+tmp/
+temp/
+*.tmp
+*.bak
+
+# === Бэкапы и дампы ===
+*.dump
+*.sql
+backups/
+
+# === Jupyter Notebooks ===
+.ipynb_checkpoints/
+*.ipynb
+
+# === Архивы ===
+*.zip
+*.tar.gz
+*.rar
+
+# === Загруженные документы (проект специфичные) ===
+Анализ*.docx
+Идентификация*.docx
+
+# === Прочее ===
+.mypy_cache/
+.ruff_cache/
+*.pid

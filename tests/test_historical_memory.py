@@ -42,11 +42,11 @@ def test_historical_memory_initialization():
     assert memory.cvd_history_1h.maxlen == 60, \
         f"FAIL: 1H должен хранить 60 часов, получили {memory.cvd_history_1h.maxlen}"
     
-    assert memory.cvd_history_4h.maxlen == 168, \
-        f"FAIL: 4H должен хранить 168 записей (4 недели), получили {memory.cvd_history_4h.maxlen}"
+    assert memory.cvd_history_4h.maxlen == 1100, \
+        f"FAIL: 4H должен хранить 1100 записей (~6 месяцев), получили {memory.cvd_history_4h.maxlen}"
     
-    assert memory.cvd_history_1d.maxlen == 30, \
-        f"FAIL: 1D должен хранить 30 дней, получили {memory.cvd_history_1d.maxlen}"
+    assert memory.cvd_history_1d.maxlen == 180, \
+        f"FAIL: 1D должен хранить 180 дней (~6 месяцев), получили {memory.cvd_history_1d.maxlen}"
     
     assert memory.cvd_history_1w.maxlen == 52, \
         f"FAIL: 1W должен хранить 52 недели, получили {memory.cvd_history_1w.maxlen}"
@@ -68,6 +68,7 @@ def test_update_history_1h_timeframe():
     memory.update_history(
         timestamp=now,
         whale_cvd=1500.0,
+        minnow_cvd=-800.0,  # WHY: Добавляем minnow_cvd (новая сигнатура)
         price=Decimal("95000")
     )
     
@@ -108,7 +109,7 @@ def test_downsample_to_higher_timeframes():
         whale_cvd = 1000.0 + i * 10  # CVD растет
         price = Decimal("95000") + Decimal(i * 5)  # Цена растет
         
-        memory.update_history(timestamp, whale_cvd, price)
+        memory.update_history(timestamp, whale_cvd, -whale_cvd * 0.5, price)  # WHY: minnow_cvd противоположен whale
     
     # ПРОВЕРКА: 1H хранит только последние 60 часов
     assert len(memory.cvd_history_1h) == 60, \
@@ -153,7 +154,7 @@ def test_cvd_divergence_detection():
     
     for hours_offset, price, cvd in data_points:
         timestamp = base_time + timedelta(hours=hours_offset)
-        memory.update_history(timestamp, float(cvd), Decimal(str(price)))
+        memory.update_history(timestamp, float(cvd), -float(cvd) * 0.3, Decimal(str(price)))  # WHY: minnow_cvd
     
     # Проверяем дивергенцию
     is_divergence, div_type = memory.detect_cvd_divergence(timeframe='1h')
@@ -188,7 +189,7 @@ def test_no_divergence_when_aligned():
     
     for hours_offset, price, cvd in data_points:
         timestamp = base_time + timedelta(hours=hours_offset)
-        memory.update_history(timestamp, float(cvd), Decimal(str(price)))
+        memory.update_history(timestamp, float(cvd), float(cvd) * 0.5, Decimal(str(price)))  # WHY: minnow_cvd также растёт
     
     is_divergence, div_type = memory.detect_cvd_divergence(timeframe='1h')
     

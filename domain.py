@@ -12,6 +12,9 @@ from enum import Enum
 # WHY: Импорт конфигурации для мульти-токен поддержки (Task: Multi-Asset Support)
 from config import AssetConfig, get_config
 
+# WHY: Import SmartCandle for multi-timeframe derivatives analysis
+from domain_smartcandle import SmartCandle
+
 
 class GapDetectedError(Exception):
     pass
@@ -47,6 +50,100 @@ class TradeEvent(BaseModel):
     is_buyer_maker: bool  # True = maker продавал (taker купил)
     event_time: int  # Timestamp в миллисекундах
     trade_id: Optional[int] = None
+
+
+class VolumeBucket(BaseModel):
+    """
+    WHY: Building block для VPIN (Volume-Synchronized Probability of Informed Trading).
+    
+    Теория (Easley-O'Hara, 2012):
+    - Вместо временных интервалов используем фиксированные объемы (Volume Bars)
+    - Корзина закрывается при достижении bucket_size (например 10 BTC)
+    - Анализ |Buy - Sell| внутри корзины даёт токсичность потока
+    
+    Токсичность (VPIN):
+    - Высокая (>0.7): Агрессоры информированы → риск пробоя айсберга
+    - Низкая (<0.3): Поток шумный (розничный) → айсберг устоит
+    
+    Источник: ТЗ "Flow Toxicity (VPIN)" в проекте.
+    """
+    bucket_size: Decimal  # Фиксированный размер корзины (в монетах токена)
+    symbol: str  # BTCUSDT, ETHUSDT и т.д.
+    
+    buy_volume: Decimal = Decimal("0")  # Накопленный объём покупок (taker купил)
+    sell_volume: Decimal = Decimal("0")  # Накопленный объём продаж (taker продал)
+    is_complete: bool = False  # True когда корзина заполнена
+    creation_time: datetime = Field(default_factory=datetime.now)
+    
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    
+    def total_volume(self) -> Decimal:
+        """WHY: Общий объём корзины (buy + sell)"""
+        return self.buy_volume + self.sell_volume
+    
+    def add_trade(self, trade: TradeEvent) -> Decimal:
+        """
+        WHY: Добавляет сделку в корзину с overflow protection.
+        
+        Логика:
+        1. Определяем направление (buy/sell) по is_buyer_maker
+        2. Добавляем объём в соответствующую сторону
+        3. Если total > bucket_size → закрываем корзину и возвращаем overflow
+        
+        Args:
+            trade: Событие сделки
+        
+        Returns:
+            Decimal: Overflow объём (если корзина переполнена)
+            0 если overflow не было
+        """
+        # Если корзина уже закрыта - игнорируем
+        if self.is_complete:
+            return trade.quantity
+        
+        # Определяем направление
+        # is_buyer_maker=False → taker купил (агрессивная покупка)
+        # is_buyer_maker=True → taker продал (агрессивная продажа)
+        is_buy = not trade.is_buyer_maker
+        
+        # Проверяем сколько места осталось
+        remaining_space = self.bucket_size - self.total_volume()
+        
+        # Если сделка помещается полностью
+        if trade.quantity <= remaining_space:
+            if is_buy:
+                self.buy_volume += trade.quantity
+            else:
+                self.sell_volume += trade.quantity
+            
+            # Проверяем закрытие
+            if self.total_volume() >= self.bucket_size:
+                self.is_complete = True
+            
+            return Decimal("0")  # Нет overflow
+        
+        # Если сделка НЕ помещается → частичное добавление
+        else:
+            if is_buy:
+                self.buy_volume += remaining_space
+            else:
+                self.sell_volume += remaining_space
+            
+            self.is_complete = True  # Корзина заполнена
+            overflow = trade.quantity - remaining_space
+            return overflow
+    
+    def calculate_imbalance(self) -> Decimal:
+        """
+        WHY: Вычисляет |Buy - Sell| для VPIN формулы.
+        
+        Формула VPIN:
+        VPIN = Σ|Buy_i - Sell_i| / (n * bucket_size)
+        
+        Returns:
+            Decimal: Абсолютное значение дисбаланса
+        """
+        return abs(self.buy_volume - self.sell_volume)
 
 class IcebergDetectionResult(BaseModel):
     """Результат обнаружения айсберга"""
@@ -95,6 +192,23 @@ class IcebergLevel(BaseModel):
     cancellation_context: Optional[CancellationContext] = None  # Контекст отмены
     spoofing_probability: float = 0.0  # Вероятность спуфинга (0.0-1.0)
     refill_count: int = 0  # Количество пополнений (для refill_frequency)
+    
+    # === НОВОЕ: Wall Resilience (Устойчивость Стены) ===
+    # WHY: Скорость восстановления айсберга после "удара" → признак силы стены
+    last_refill_time: Optional[datetime] = None  # Время последнего пополнения
+    average_refill_delay_ms: Optional[float] = None  # Средняя задержка пополнения
+    
+    # === GEMINI FIX: Категоризация по размеру (Wall Semantics) ===
+    # WHY: Разделяем whale ($100k+) и dolphin ($1k-$100k) стены для wall_*_vol метрик
+    is_dolphin: bool = False  # True если $1k-$100k, False если whale >$100k
+    
+    # === GEMINI ENHANCEMENT #2: Micro-Divergence VPIN Tracking ===
+    # WHY: Отслеживаем токсичность потока ВНУТРИ жизненного цикла айсберга
+    vpin_history: List[Tuple[datetime, float]] = Field(default_factory=list)  # История VPIN при рефиллах
+    
+    # === GEMINI ENHANCEMENT #3: Trade Footprint (для визуализации) ===
+    # WHY: Сохраняем распределение сделок для ретроспективного анализа
+    trade_footprint: List[Dict] = Field(default_factory=list)  # [{time, qty, is_buy, cohort}, ...]
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
     
@@ -141,6 +255,254 @@ class IcebergLevel(BaseModel):
         # Переводим в минуты
         lifetime_minutes = lifetime_seconds / 60.0
         return self.refill_count / lifetime_minutes if lifetime_minutes > 0 else 0.0
+    
+    def calculate_wall_resilience(self) -> Optional[str]:
+        """
+        WHY: Рассчитывает устойчивость "стены" (Wall Resilience).
+        
+        Теория (документ "Разделение стены и удара"):
+        - Быстрое восстановление (<50ms) = "железобетонная" стена
+        - Медленное восстановление (>200ms) = стена истощена
+        - Нет восстановления = отмена (спуфинг)
+        
+        Returns:
+            'STRONG' | 'MODERATE' | 'WEAK' | 'EXHAUSTED' | None
+        """
+        # Если нет данных о пополнениях
+        if self.average_refill_delay_ms is None:
+            return None
+        
+        delay = self.average_refill_delay_ms
+        
+        # STRONG: <50ms - биржевой refill (нативный айсберг)
+        if delay < 50:
+            return 'STRONG'
+        
+        # MODERATE: 50-200ms - алгоритмическое пополнение
+        elif delay < 200:
+            return 'MODERATE'
+        
+        # WEAK: 200-500ms - медленный алгоритм
+        elif delay < 500:
+            return 'WEAK'
+        
+        # EXHAUSTED: >500ms - стена истощена
+        else:
+            return 'EXHAUSTED'
+    
+    # ========================================================================
+    # GEMINI ENHANCEMENT #1: Relative Depth Absorption
+    # ========================================================================
+    
+    def calculate_relative_depth_ratio(
+        self, 
+        order_book: 'LocalOrderBook', 
+        depth: int = 20
+    ) -> float:
+        """
+        WHY: Рассчитывает отношение скрытого объёма к видимой ликвидности.
+        
+        Теория (Gemini Enhancement #1):
+        - Если айсберг поглотил 200% видимой ликвидности → Institutional Anchor
+        - ratio > 1.5 = Мощная стена
+        - ratio < 0.5 = Мелкий айсберг (шум)
+        
+        Args:
+            order_book: LocalOrderBook для расчёта видимой ликвидности
+            depth: Глубина анализа (топ-N уровней)
+        
+        Returns:
+            float: ratio = total_hidden_volume / visible_depth
+        
+        Example:
+            >>> # 10 BTC скрытого vs 5 BTC видимого
+            >>> iceberg.total_hidden_volume = Decimal('10.0')
+            >>> book.bids = {Decimal('60000'): Decimal('5.0')}
+            >>> ratio = iceberg.calculate_relative_depth_ratio(book)
+            >>> assert ratio == 2.0  # 200% absorption!
+        """
+        # 1. Определяем сторону стакана
+        book_side = order_book.asks if self.is_ask else order_book.bids
+        
+        if not book_side:
+            return 0.0  # Нет ликвидности в стакане
+        
+        # 2. Суммируем видимую ликвидность топ-N уровней
+        visible_volume = Decimal('0')
+        
+        if self.is_ask:
+            # ASK: берём самые дешёвые (с начала)
+            for i, (price, qty) in enumerate(book_side.items()):
+                if i >= depth:
+                    break
+                visible_volume += qty
+        else:
+            # BID: берём самые дорогие (с конца)
+            for i, (price, qty) in enumerate(reversed(book_side.items())):
+                if i >= depth:
+                    break
+                visible_volume += qty
+        
+        if visible_volume == 0:
+            return 0.0
+        
+        # 3. Рассчитываем ratio
+        ratio = float(self.total_hidden_volume / visible_volume)
+        return ratio
+    
+    # ========================================================================
+    # GEMINI ENHANCEMENT #2: Micro-Divergence (VPIN inside iceberg)
+    # ========================================================================
+    
+    def update_micro_divergence(
+        self,
+        vpin_at_refill: float,
+        whale_volume_pct: float,
+        minnow_volume_pct: float,
+        price_drift_bps: float = 0.0
+    ):
+        """
+        WHY: Отслеживаем VPIN ВНУТРИ жизненного цикла айсберга (CRYPTO-AWARE).
+        
+        === КРИТИЧЕСКОЕ ОТЛИЧИЕ ОТ TradFi (Gemini Fix) ===
+        TradFi: Высокий VPIN = Informed Trading → ШТРАФ
+        Crypto: Высокий VPIN может быть:
+          A) Whale Attack → ШТРАФ (confidence DOWN)
+          B) Minnow Panic → БОНУС (confidence UP) - айсберг ест ликвидации!
+        
+        Решение: Смотрим КТО создаёт VPIN (whale_volume_pct vs minnow_volume_pct)
+        
+        Args:
+            vpin_at_refill: VPIN в момент рефилла (0.0-1.0)
+            whale_volume_pct: Доля whale объёма в потоке (0.0-1.0)
+            minnow_volume_pct: Доля minnow объёма в потоке (0.0-1.0)
+            price_drift_bps: Смещение цены против айсберга в bps (>0 = слабость)
+        
+        Updates:
+            - vpin_history: Добавляет точку данных
+            - confidence_score: УМНАЯ корректировка на основе состава потока
+        
+        Examples:
+            >>> # СЦЕНАРИЙ А: Whale Attack (VPIN 0.8, whale 70%)
+            >>> iceberg.update_micro_divergence(0.8, whale_volume_pct=0.7, minnow_volume_pct=0.2)
+            >>> # confidence ПАДАЕТ (киты атакуют)
+            
+            >>> # СЦЕНАРИЙ Б: Panic Absorption (VPIN 0.9, minnow 80%)
+            >>> iceberg.update_micro_divergence(0.9, whale_volume_pct=0.1, minnow_volume_pct=0.8)
+            >>> # confidence НЕ падает или даже РАСТЁТ (поглощение паники!)
+        """
+        now = datetime.now()
+        
+        # 1. Сохраняем VPIN в историю
+        self.vpin_history.append((now, vpin_at_refill))
+        
+        # 2. БАЗОВАЯ ОЦЕНКА: Низкий VPIN = всё хорошо
+        if vpin_at_refill < 0.5:
+            return  # Нормальный поток, ничего не делаем
+        
+        # 3. УМНАЯ ЛОГИКА: Анализируем СОСТАВ потока
+        # WHY: Высокий VPIN может быть как угрозой, так и возможностью
+        
+        # === СЦЕНАРИЙ А: WHALE ATTACK (Киты пытаются пробить) ===
+        if whale_volume_pct > 0.6:  # >60% объёма от китов
+            # WHY: Крупные игроки атакуют → айсберг под угрозой
+            if vpin_at_refill > 0.7:
+                penalty = 0.25  # Сильный штраф
+            else:
+                penalty = 0.15  # Умеренный штраф
+            
+            # Дополнительный штраф за дрейф цены
+            if price_drift_bps > 5.0:  # Цена "прогибается" >5 bps
+                penalty += 0.1
+            
+            self.confidence_score = max(0.0, self.confidence_score - penalty)
+            return
+        
+        # === СЦЕНАРИЙ Б: PANIC ABSORPTION (Айсберг ест толпу) ===
+        elif minnow_volume_pct > 0.6:  # >60% объёма от minnows
+            # WHY: Толпа в панике → айсберг поглощает ликвидации
+            # В крипте это БЫЧИЙ сигнал для лимитного ордера!
+            
+            if vpin_at_refill > 0.8:
+                # ЭКСТРЕМАЛЬНАЯ паника → ОЧЕНЬ сильный уровень
+                bonus = 0.1  # +10% confidence
+                self.confidence_score = min(1.0, self.confidence_score + bonus)
+            
+            # Проверка стабильности цены (защита от Adverse Selection)
+            if price_drift_bps > 10.0:  # Сильный дрейф = айсберг слабеет
+                penalty = 0.05
+                self.confidence_score = max(0.0, self.confidence_score - penalty)
+            
+            return
+        
+        # === СЦЕНАРИЙ В: СМЕШАННЫЙ ПОТОК (Осторожность) ===
+        else:
+            # WHY: Нет доминирующей когорты → консервативный подход
+            if vpin_at_refill > 0.7:
+                penalty = 0.1  # Лёгкий штраф (неопределённость)
+            else:
+                penalty = 0.05
+            
+            self.confidence_score = max(0.0, self.confidence_score - penalty)
+    
+    # ========================================================================
+    # GEMINI ENHANCEMENT #3: Trade Footprint (Histogram)
+    # ========================================================================
+    
+    def add_trade_to_footprint(self, trade: TradeEvent):
+        """
+        WHY: Сохраняет сделку для гистограммы footprint.
+        
+        Теория (Gemini Enhancement #3):
+        - Сохраняем все сделки на уровне айсберга
+        - Разделяем по cohort (whale/dolphin/fish)
+        - Используется для визуализации и анализа
+        
+        Args:
+            trade: TradeEvent (сделка на этом уровне)
+        
+        Updates:
+            trade_footprint: Добавляет запись
+        """
+        # 1. Определяем направление
+        is_buy = not trade.is_buyer_maker  # False = buyer aggressive
+        
+        # 2. Определяем cohort (по размеру сделки)
+        # WHY: Используем те же пороги что и в OrderFlowAnalyzer
+        qty_float = float(trade.quantity)
+        
+        if qty_float >= 5.0:  # BTC единицы (adjustable per asset)
+            cohort = 'WHALE'
+        elif qty_float >= 1.0:
+            cohort = 'DOLPHIN'
+        else:
+            cohort = 'FISH'
+        
+        # 3. Сохраняем запись
+        self.trade_footprint.append({
+            'time': datetime.fromtimestamp(trade.event_time / 1000),  # ms → seconds
+            'quantity': trade.quantity,
+            'is_buy': is_buy,
+            'cohort': cohort
+        })
+    
+    def get_footprint_buy_ratio(self) -> float:
+        """
+        WHY: Рассчитывает долю покупок в footprint.
+        
+        Returns:
+            float: 0.0-1.0 (1.0 = все сделки были покупками)
+        
+        Example:
+            >>> # 7 buy, 3 sell → 0.7
+            >>> iceberg.get_footprint_buy_ratio()
+            0.7
+        """
+        if not self.trade_footprint:
+            return 0.0
+        
+        buy_count = sum(1 for t in self.trade_footprint if t['is_buy'])
+        return buy_count / len(self.trade_footprint)
 
 
 # ===========================================================================
@@ -225,31 +587,59 @@ class HistoricalMemory(BaseModel):
     - 4H (240 мин): Основной свинг-таймфрейм (тренд)
     - 1D (1440 мин): Среднесрочное позиционирование
     - 1W (10080 мин): Долгосрочный контекст (мажоры vs свинг)
+    - 1M (43200 мин): Макро-тренд (структурный анализ)
     """
     
     # История Whale CVD
     cvd_history_1h: deque = Field(default_factory=lambda: deque(maxlen=60))   # 60 часов
-    cvd_history_4h: deque = Field(default_factory=lambda: deque(maxlen=168))  # 4 недели (168 = 4*24/4 * 7)
-    cvd_history_1d: deque = Field(default_factory=lambda: deque(maxlen=30))   # 30 дней
-    cvd_history_1w: deque = Field(default_factory=lambda: deque(maxlen=52))   # 52 недели (год)
+    
+    # === SAFE CHANGE: SCALING MEMORY FOR SWING ===
+    # WHY: 6 месяцев контекста для детекции долгосрочных накоплений
+    cvd_history_4h: deque = Field(default_factory=lambda: deque(maxlen=1100))  # ~6 месяцев (180 дней * 6 баров)
+    cvd_history_1d: deque = Field(default_factory=lambda: deque(maxlen=180))   # 6 месяцев
+    cvd_history_1w: deque = Field(default_factory=lambda: deque(maxlen=52))   # 52 недели (год) - unchanged
+    cvd_history_1m: deque = Field(default_factory=lambda: deque(maxlen=12))   # 12 месяцев (год)
+    
+    # WHY: История Minnow CVD для Wyckoff накопления (Task: Full Wyckoff Implementation)
+    minnow_cvd_history_1h: deque = Field(default_factory=lambda: deque(maxlen=60))
+    minnow_cvd_history_4h: deque = Field(default_factory=lambda: deque(maxlen=1100))  # ~6 месяцев
+    minnow_cvd_history_1d: deque = Field(default_factory=lambda: deque(maxlen=180))   # 6 месяцев
+    minnow_cvd_history_1w: deque = Field(default_factory=lambda: deque(maxlen=52))   # unchanged
+    minnow_cvd_history_1m: deque = Field(default_factory=lambda: deque(maxlen=12))
+    
+    # === НОВОЕ: Разделение Whale CVD на Passive/Aggressive (Wall Resilience) ===
+    # WHY: Различаем "стену" (passive accumulation) и "удар" (aggressive entry)
+    # Теория: Passive = киты стоят айсбергом, Aggressive = киты бьют по рынку
+    whale_passive_accumulation_1h: deque = Field(default_factory=lambda: deque(maxlen=60))
+    whale_aggressive_entry_1h: deque = Field(default_factory=lambda: deque(maxlen=60))
     
     # История цены (mid_price)
     price_history_1h: deque = Field(default_factory=lambda: deque(maxlen=60))
-    price_history_4h: deque = Field(default_factory=lambda: deque(maxlen=168))
-    price_history_1d: deque = Field(default_factory=lambda: deque(maxlen=30))
-    price_history_1w: deque = Field(default_factory=lambda: deque(maxlen=52))
+    price_history_4h: deque = Field(default_factory=lambda: deque(maxlen=1100))  # ~6 месяцев
+    price_history_1d: deque = Field(default_factory=lambda: deque(maxlen=180))   # 6 месяцев
+    price_history_1w: deque = Field(default_factory=lambda: deque(maxlen=52))   # unchanged
+    price_history_1m: deque = Field(default_factory=lambda: deque(maxlen=12))
     
     # Метаданные для downsampling
     last_update_1h: Optional[datetime] = None
     last_update_4h: Optional[datetime] = None
     last_update_1d: Optional[datetime] = None
     last_update_1w: Optional[datetime] = None
+    last_update_1m: Optional[datetime] = None
     
     model_config = ConfigDict(arbitrary_types_allowed=True)
     
-    def update_history(self, timestamp: datetime, whale_cvd: float, price: Decimal):
+    def update_history(self, timestamp: datetime, whale_cvd: float, minnow_cvd: float, price: Decimal, is_passive: bool = True):
         """
         WHY: Добавляет новую точку данных и агрегирует в старшие таймфреймы.
+        
+        === UPDATE: Full Wyckoff Support (Task: Minnow CVD Integration) ===
+        Теперь сохраняет как Whale так и Minnow CVD для детекции паники толпы.
+        
+        === UPDATE: Passive/Aggressive Separation (Wall Resilience) ===
+        Теперь разделяет Whale CVD на:
+        - Passive: Киты стоят айсбергами (СТЕНА)
+        - Aggressive: Киты бьют по рынку (УДАР)
         
         Логика:
         1. Всегда добавляем в 1H (самый мелкий таймфрейм)
@@ -260,11 +650,23 @@ class HistoricalMemory(BaseModel):
         Args:
             timestamp: Время события
             whale_cvd: Whale CVD в этот момент
+            minnow_cvd: Minnow CVD в этот момент (для Wyckoff паники)
             price: Mid price в этот момент
+            is_passive: True если киты стоят айсбергом, False если бьют по рынку
         """
         # 1. Всегда добавляем в 1H
         self.cvd_history_1h.append((timestamp, whale_cvd))
+        self.minnow_cvd_history_1h.append((timestamp, minnow_cvd))
         self.price_history_1h.append((timestamp, price))
+        
+        # === PASSIVE/AGGRESSIVE SEPARATION ===
+        # WHY: Разделяем whale CVD на "стену" и "удар"
+        if is_passive:
+            # Киты стоят айсбергом (пассивное накопление)
+            self.whale_passive_accumulation_1h.append((timestamp, whale_cvd))
+        else:
+            # Киты бьют по рынку (агрессивный вход)
+            self.whale_aggressive_entry_1h.append((timestamp, whale_cvd))
         
         # WHY: Инициализируем last_update при первом вызове (но НЕ добавляем в старшие таймфреймы)
         if self.last_update_1h is None:
@@ -272,6 +674,7 @@ class HistoricalMemory(BaseModel):
             self.last_update_4h = timestamp
             self.last_update_1d = timestamp
             self.last_update_1w = timestamp
+            self.last_update_1m = timestamp
             return  # Первая точка - только инициализация
         
         self.last_update_1h = timestamp
@@ -279,24 +682,39 @@ class HistoricalMemory(BaseModel):
         # 2. Downsample в 4H (если прошло 4+ часа)
         if (timestamp - self.last_update_4h).total_seconds() >= 4 * 3600:
             self.cvd_history_4h.append((timestamp, whale_cvd))
+            self.minnow_cvd_history_4h.append((timestamp, minnow_cvd))
             self.price_history_4h.append((timestamp, price))
             self.last_update_4h = timestamp
         
         # 3. Downsample в 1D (если прошло 24+ часа)
         if (timestamp - self.last_update_1d).total_seconds() >= 24 * 3600:
             self.cvd_history_1d.append((timestamp, whale_cvd))
+            self.minnow_cvd_history_1d.append((timestamp, minnow_cvd))
             self.price_history_1d.append((timestamp, price))
             self.last_update_1d = timestamp
         
         # 4. Downsample в 1W (если прошло 168+ часов)
         if (timestamp - self.last_update_1w).total_seconds() >= 168 * 3600:
             self.cvd_history_1w.append((timestamp, whale_cvd))
+            self.minnow_cvd_history_1w.append((timestamp, minnow_cvd))
             self.price_history_1w.append((timestamp, price))
             self.last_update_1w = timestamp
+        
+        # 5. Downsample в 1M (если прошло 720+ часов = 30 дней)
+        if (timestamp - self.last_update_1m).total_seconds() >= 720 * 3600:
+            self.cvd_history_1m.append((timestamp, whale_cvd))
+            self.minnow_cvd_history_1m.append((timestamp, minnow_cvd))
+            self.price_history_1m.append((timestamp, price))
+            self.last_update_1m = timestamp
     
     def detect_cvd_divergence(self, timeframe: str = '1h') -> Tuple[bool, Optional[str]]:
         """
         WHY: Детектирует CVD дивергенцию (накопление/дистрибуция).
+        
+        === UPDATE: Full Wyckoff Logic (Task: Minnow Panic Detection) ===
+        Теперь проверяет ПОЛНОЕ Wyckoff условие:
+        - BULLISH: Price ↓ + Whale CVD ↑ + Minnow CVD ↓ (паника толпы)
+        - BEARISH: Price ↑ + Whale CVD ↓ + Minnow CVD ↑ (жадность толпы)
         
         Логика (из документа "Smart Money Analysis"):
         - БЫЧЬЯ дивергенция: Цена делает Lower Low, CVD делает Higher Low
@@ -313,37 +731,59 @@ class HistoricalMemory(BaseModel):
         # Выбираем нужный таймфрейм
         if timeframe == '1h':
             cvd_hist = self.cvd_history_1h
+            minnow_hist = self.minnow_cvd_history_1h
             price_hist = self.price_history_1h
         elif timeframe == '4h':
             cvd_hist = self.cvd_history_4h
+            minnow_hist = self.minnow_cvd_history_4h
             price_hist = self.price_history_4h
         elif timeframe == '1d':
             cvd_hist = self.cvd_history_1d
+            minnow_hist = self.minnow_cvd_history_1d
             price_hist = self.price_history_1d
         elif timeframe == '1w':
             cvd_hist = self.cvd_history_1w
+            minnow_hist = self.minnow_cvd_history_1w
             price_hist = self.price_history_1w
+        elif timeframe == '1m':
+            cvd_hist = self.cvd_history_1m
+            minnow_hist = self.minnow_cvd_history_1m
+            price_hist = self.price_history_1m
         else:
             return False, None
         
         # Нужно минимум 3 точки для дивергенции
-        if len(cvd_hist) < 3 or len(price_hist) < 3:
+        if len(cvd_hist) < 3 or len(minnow_hist) < 3 or len(price_hist) < 3:
             return False, None
         
         # Берем последние 3 точки
         recent_cvds = list(cvd_hist)[-3:]
+        recent_minnows = list(minnow_hist)[-3:]
         recent_prices = list(price_hist)[-3:]
         
         # Извлекаем значения
-        cvd_values = [c[1] for c in recent_cvds]
+        whale_cvd_values = [c[1] for c in recent_cvds]
+        minnow_cvd_values = [m[1] for m in recent_minnows]
         price_values = [float(p[1]) for p in recent_prices]
         
-        # Проверяем БЫЧЬЮ дивергенцию (Lower Low price, Higher Low CVD)
-        if price_values[-1] < price_values[0] and cvd_values[-1] > cvd_values[0]:
+        # WHY: Full Wyckoff conditions (3 компонента)
+        price_falling = price_values[-1] < price_values[0]  # Lower Low
+        price_rising = price_values[-1] > price_values[0]   # Higher High
+        
+        whale_buying = whale_cvd_values[-1] > whale_cvd_values[0]  # Higher Low (accumulation)
+        whale_selling = whale_cvd_values[-1] < whale_cvd_values[0]  # Lower High (distribution)
+        
+        minnow_panic = minnow_cvd_values[-1] < minnow_cvd_values[0]  # Minnows selling (panic)
+        minnow_greed = minnow_cvd_values[-1] > minnow_cvd_values[0]  # Minnows buying (greed)
+        
+        # Проверяем БЫЧЬЮ дивергенцию (ACCUMULATION)
+        # Price ↓ + Whale CVD ↑ + Minnow CVD ↓
+        if price_falling and whale_buying and minnow_panic:
             return True, 'BULLISH'
         
-        # Проверяем МЕДВЕЖЬЮ дивергенцию (Higher High price, Lower High CVD)
-        if price_values[-1] > price_values[0] and cvd_values[-1] < cvd_values[0]:
+        # Проверяем МЕДВЕЖЬЮ дивергенцию (DISTRIBUTION)
+        # Price ↑ + Whale CVD ↓ + Minnow CVD ↑
+        if price_rising and whale_selling and minnow_greed:
             return True, 'BEARISH'
         
         return False, None
@@ -367,7 +807,8 @@ class LocalOrderBook(BaseModel):
     
     bids: SortedDict = Field(default_factory=SortedDict)
     asks: SortedDict = Field(default_factory=SortedDict)
-    gamma_profile: Optional[GammaProfile] = None 
+    gamma_profile: Optional[GammaProfile] = None
+    latest_wyckoff_divergence: Optional[dict] = None  # ✅ GEMINI: Best divergence from AccumulationDetector
     last_update_id: int = 0
     
     def __init__(self, **data):
@@ -405,6 +846,14 @@ class LocalOrderBook(BaseModel):
     # Для детекции айсбергов с временной валидацией (Delta-t)
     # Структура: [{'trade': TradeEvent, 'visible_before': Decimal, 'trade_time_ms': int, 'price': Decimal, 'is_ask': bool}, ...]
     pending_refill_checks: deque = Field(default_factory=deque)
+    
+    # === НОВОЕ ПОЛЕ ДЛЯ VPIN (Task: Flow Toxicity) ===
+    # WHY: История корзин для расчёта VPIN (Volume-Synchronized Probability of Informed Trading)
+    # Храним последние N корзин (обычно 50) для скользящего окна
+    vpin_buckets: deque = Field(default_factory=lambda: deque(maxlen=50))
+    
+    # WHY: Текущая незакрытая корзина (наполняется сделками)
+    current_vpin_bucket: Optional[VolumeBucket] = None
     
     # === НОВЫЕ ПОЛЯ ДЛЯ OFI (Task: OFI Implementation) ===
     # WHY: Хранение предыдущего состояния для расчета Order Flow Imbalance
@@ -619,13 +1068,19 @@ class LocalOrderBook(BaseModel):
                 lvl.is_gamma_wall = lvl.is_gamma_wall or is_gamma 
                 return lvl
         
+        # === GEMINI FIX: Категоризация по размеру (Wall Semantics) ===
+        # WHY: Определяем is_dolphin для wall_whale_vol vs wall_dolphin_vol метрик
+        volume_usd = float(hidden_vol) * float(price)
+        is_dolphin = (1000 < volume_usd <= 100000)  # $1k-$100k = dolphin, >$100k = whale
+        
         # Создаем новый
         new_lvl = IcebergLevel(
             price=price,
             is_ask=is_ask,
             total_hidden_volume=hidden_vol,
             is_gamma_wall=is_gamma,
-            confidence_score=confidence
+            confidence_score=confidence,
+            is_dolphin=is_dolphin  # ✅ Категоризация
         )
         self.active_icebergs[price] = new_lvl
         return new_lvl
@@ -1174,6 +1629,82 @@ class LocalOrderBook(BaseModel):
             confidence = min(1.0, (price_strength + cvd_strength) / 2.0)
         
         return is_divergence, divergence_type, confidence
+    
+    def get_latest_cvd(self, timeframe: str = '1h', cohort: str = 'whale') -> Optional[float]:
+        """
+        WHY: Helper для получения последнего CVD значения по таймфрейму.
+        
+        Args:
+            timeframe: '1h', '4h', '1d', '1w', '1m'
+            cohort: 'whale' или 'minnow'
+        
+        Returns:
+            float: Последнее CVD значение или None если нет данных
+        """
+        # Выбираем нужную историю
+        if cohort == 'whale':
+            hist_map = {
+                '1h': self.historical_memory.cvd_history_1h,
+                '4h': self.historical_memory.cvd_history_4h,
+                '1d': self.historical_memory.cvd_history_1d,
+                '1w': self.historical_memory.cvd_history_1w,
+                '1m': self.historical_memory.cvd_history_1m
+            }
+        else:  # minnow
+            hist_map = {
+                '1h': self.historical_memory.minnow_cvd_history_1h,
+                '4h': self.historical_memory.minnow_cvd_history_4h,
+                '1d': self.historical_memory.minnow_cvd_history_1d,
+                '1w': self.historical_memory.minnow_cvd_history_1w,
+                '1m': self.historical_memory.minnow_cvd_history_1m
+            }
+        
+        hist = hist_map.get(timeframe)
+        if hist and len(hist) > 0:
+            # Возвращаем последнее значение (timestamp, cvd)
+            return hist[-1][1]
+        return None
+    
+    def get_cvd_change(self, timeframe: str = '1h', cohort: str = 'whale', periods: int = 3) -> Optional[float]:
+        """
+        WHY: Вычисляет изменение CVD за последние N периодов.
+        
+        Args:
+            timeframe: '1h', '4h', '1d', '1w', '1m'
+            cohort: 'whale' или 'minnow'
+            periods: Количество периодов для анализа
+        
+        Returns:
+            float: CVD_latest - CVD_start (положительное = покупки)
+        """
+        # Выбираем историю
+        if cohort == 'whale':
+            hist_map = {
+                '1h': self.historical_memory.cvd_history_1h,
+                '4h': self.historical_memory.cvd_history_4h,
+                '1d': self.historical_memory.cvd_history_1d,
+                '1w': self.historical_memory.cvd_history_1w,
+                '1m': self.historical_memory.cvd_history_1m
+            }
+        else:
+            hist_map = {
+                '1h': self.historical_memory.minnow_cvd_history_1h,
+                '4h': self.historical_memory.minnow_cvd_history_4h,
+                '1d': self.historical_memory.minnow_cvd_history_1d,
+                '1w': self.historical_memory.minnow_cvd_history_1w,
+                '1m': self.historical_memory.minnow_cvd_history_1m
+            }
+        
+        hist = hist_map.get(timeframe)
+        if not hist or len(hist) < periods:
+            return None
+        
+        # Берём последние N точек
+        recent = list(hist)[-periods:]
+        cvd_start = recent[0][1]
+        cvd_end = recent[-1][1]
+        
+        return cvd_end - cvd_start
 
 
 # ===========================================================================
@@ -1266,3 +1797,5 @@ class IcebergQualityTags:
         if self.cvd_divergence: tags.append("🔀CVD_DIVERGENCE")
         if self.is_persistent: tags.append("⏳PERSISTENT")
         return " ".join(tags) if tags else "NO_TAGS"
+
+

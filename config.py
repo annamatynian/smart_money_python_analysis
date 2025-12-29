@@ -25,6 +25,12 @@ class AssetConfig:
     min_whale_floor_usd: float
     min_minnow_floor_usd: float
     
+    # --- 4.1 Accumulation Detector (Wyckoff) ---
+    # WHY: Порог для passive_absorption (в монетах токена!)
+    # Теория: R_abs = total/visible. Если total=threshold, visible=threshold/10 → R_abs=10 (кит)
+    # Gemini Fix: Мульти-ассет поддержка (вместо хардкода 2.0 BTC)
+    accumulation_whale_threshold: Decimal
+    
     # --- 5. Spoofing & Breach ---
     spoofing_volume_threshold: Decimal  # Порог объема для подозрений (в монетах!)
     breach_tolerance_pct: Decimal       # % толеранс для пробоя
@@ -34,6 +40,12 @@ class AssetConfig:
     
     # --- 7. OFI Depth ---
     ofi_depth: int = 20                 # Глубина расчёта OFI (WHY: Gemini Phase 2.2 - Dynamic Depth)
+    
+    # --- 8. VPIN (Flow Toxicity) ---
+    vpin_bucket_size: Decimal = Decimal("10")  # Размер корзины для VPIN (в монетах токена)
+    vpin_window_size: int = 50                  # Количество корзин в скользящем окне
+    vpin_toxicity_threshold: float = 0.7        # Порог токсичности (>0.7 = toxic flow)
+    vpin_noise_threshold: float = 0.3           # Порог шума (<0.3 = noisy flow)
 
 # --- КОНФИГУРАЦИИ ---
 
@@ -52,13 +64,20 @@ BTC_CONFIG = AssetConfig(
     static_minnow_threshold_usd=1000.0,
     min_whale_floor_usd=10000.0,
     min_minnow_floor_usd=100.0,
+    # Accumulation
+    accumulation_whale_threshold=Decimal("2.0"),  # WHY: 2.0 BTC ≈ $200k (кит, R_abs>10)
     # Risk
     spoofing_volume_threshold=Decimal("0.1"),
     breach_tolerance_pct=Decimal("0.0005"),
     # OBI
     lambda_decay=0.1,  # WHY: BTC узкие спреды → агрессивная фильтрация
     # OFI
-    ofi_depth=20  # WHY: BTC узкие спреды → 20 уровней достаточно
+    ofi_depth=20,  # WHY: BTC узкие спреды → 20 уровней достаточно
+    # VPIN
+    vpin_bucket_size=Decimal("10"),       # WHY: 10 BTC ≈ $1M (минимальный институциональный объем)
+    vpin_window_size=50,                   # WHY: 50 корзин = 500 BTC история (рекомендация Easley-O'Hara)
+    vpin_toxicity_threshold=0.7,           # WHY: Стандарт из академической литературы
+    vpin_noise_threshold=0.3               # WHY: Стандарт из академической литературы
 )
 
 ETH_CONFIG = AssetConfig(
@@ -76,13 +95,20 @@ ETH_CONFIG = AssetConfig(
     static_minnow_threshold_usd=500.0,
     min_whale_floor_usd=5000.0,
     min_minnow_floor_usd=50.0,
+    # Accumulation
+    accumulation_whale_threshold=Decimal("30.0"),  # WHY: 30 ETH ≈ $100k (кит, R_abs>10)
     # Risk
     spoofing_volume_threshold=Decimal("2.0"),
     breach_tolerance_pct=Decimal("0.001"),
     # OBI
     lambda_decay=0.05,  # WHY: ETH шире спреды → мягче фильтр
     # OFI
-    ofi_depth=30  # WHY: ETH более волатильный → больше глубина
+    ofi_depth=30,  # WHY: ETH более волатильный → больше глубина
+    # VPIN
+    vpin_bucket_size=Decimal("100"),      # WHY: 100 ETH ≈ $300k (меньше ликвидность чем BTC)
+    vpin_window_size=50,                   # WHY: Стандарт 50 корзин
+    vpin_toxicity_threshold=0.7,           # WHY: Стандарт
+    vpin_noise_threshold=0.3               # WHY: Стандарт
 )
 
 # Для примера: SOL (чтобы понять зачем нужны форматы)
@@ -97,10 +123,17 @@ SOL_CONFIG = AssetConfig(
     static_minnow_threshold_usd=200.0,
     min_whale_floor_usd=2000.0,
     min_minnow_floor_usd=20.0,
+    # Accumulation
+    accumulation_whale_threshold=Decimal("500.0"),  # WHY: 500 SOL ≈ $100k (кит, R_abs>10)
     spoofing_volume_threshold=Decimal("20.0"),
     breach_tolerance_pct=Decimal("0.001"),
     lambda_decay=0.03,  # WHY: SOL очень волатильный → минимальная фильтрация
-    ofi_depth=50  # WHY: SOL очень волатильный → максимальная глубина
+    ofi_depth=50,  # WHY: SOL очень волатильный → максимальная глубина
+    # VPIN
+    vpin_bucket_size=Decimal("500"),      # WHY: 500 SOL ≈ $75k (малая ликвидность)
+    vpin_window_size=50,                   # WHY: Стандарт 50 корзин
+    vpin_toxicity_threshold=0.75,          # WHY: Выше порог для волатильного актива
+    vpin_noise_threshold=0.25              # WHY: Ниже порог для волатильного актива
 )
 
 CONFIG_REGISTRY = {

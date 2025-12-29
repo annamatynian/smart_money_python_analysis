@@ -1,9 +1,12 @@
 from decimal import Decimal
 from typing import Optional, List, Tuple
-from domain import LocalOrderBook, TradeEvent, IcebergLevel, CancellationContext, GammaProfile, AlgoDetectionMetrics
+from domain import LocalOrderBook, TradeEvent, IcebergLevel, CancellationContext, GammaProfile, AlgoDetectionMetrics, VolumeBucket
 from events import IcebergDetectedEvent
 # WHY: Импорт конфигурации для мульти-токен поддержки (Task: Multi-Asset Support)
 from config import AssetConfig
+import asyncio  # WHY: Gemini recommendation - Thread Safety для кеша
+import logging  # WHY: Gemini recommendation - Memory Management логирование
+from datetime import datetime, timedelta  # WHY: Для cleanup task
 
 
 class IcebergAnalyzer:
@@ -84,7 +87,9 @@ class IcebergAnalyzer:
         trade: TradeEvent,
         visible_before: Decimal,
         delta_t_ms: int,
-        update_time_ms: int
+        update_time_ms: int,
+        vpin_score: Optional[float] = None,
+        cvd_divergence: Optional[dict] = None
     ) -> Optional[IcebergDetectedEvent]:
         """
         WHY: Анализ с учетом временной валидации (Delta-t).
@@ -174,12 +179,26 @@ class IcebergAnalyzer:
             base_confidence = volume_confidence * refill_probability
             
             # === НОВОЕ: GEX-ADJUSTMENT ===
-            # Модифицируем уверенность на основе Gamma Exposure
+            # Модифицируем уверенность на основе Gamma Exposure + VPIN + CVD
+            # WHY: vpin_score и cvd_divergence приходят из services.py (контекст торговли)
+            
+            # Преобразуем cvd_divergence из dict в tuple для adjust_confidence_by_gamma
+            cvd_tuple = None
+            if cvd_divergence is not None:
+                # cvd_divergence = {'type': 'BULLISH'/'BEARISH', 'confidence': float, ...}
+                cvd_tuple = (
+                    True,  # is_divergence
+                    cvd_divergence.get('type', 'BULLISH'),  # div_type
+                    cvd_divergence.get('confidence', 0.0)   # confidence
+                )
+            
             dynamic_confidence, is_major_gamma = self.adjust_confidence_by_gamma(
                 base_confidence=base_confidence,
                 gamma_profile=book.gamma_profile,
                 price=trade.price,
-                is_ask=is_ask_iceberg
+                is_ask=is_ask_iceberg,
+                vpin_score=vpin_score,        # Передано из services.py
+                cvd_divergence=cvd_tuple      # Преобразовано из dict -> tuple
             )
             
             # Если это major gamma event - логируем
@@ -212,68 +231,216 @@ class IcebergAnalyzer:
         base_confidence: float,
         gamma_profile: Optional[GammaProfile],
         price: Decimal,
-        is_ask: bool
+        is_ask: bool,
+        vpin_score: Optional[float] = None,
+        cvd_divergence: Optional[Tuple[bool, str, float]] = None
     ) -> Tuple[float, bool]:
         """
-        WHY: Модифицирует уверенность на основе GEX-контекста.
+        WHY: Модифицирует уверенность на основе GEX, VPIN и CVD дивергенций.
         
-        Теория (документация "Анализ данных смарт-мани", раздел 4.1):
+        === UPDATE: CVD Enhancement (Phase 2) ===
+        Теперь учитывает дивергенции Whale CVD для улучшения свинг-трейдинг сигналов.
+        
+        Теория (документация "Анализ данных смарт-мани"):
+        
+        ФАЗА 1 - GEX ADJUSTMENT:
         - Положительная Гамма (+GEX): Дилеры гасят волатильность → айсберги на gamma_wall КРАЙНЕ надежны
         - Отрицательная Гамма (-GEX): Gamma Squeeze → айсберги менее стабильны
         - Пробой gamma_wall = major structural event
+        
+        ФАЗА 2 - VPIN ADJUSTMENT:
+        - VPIN > 0.7: Токсичный поток (информированные агрессоры) → СНИЖАЕМ confidence
+        - VPIN < 0.3: Шумный поток (розничные) → ПОВЫШАЕМ confidence
+        
+        ФАЗА 3 - CVD DIVERGENCE ADJUSTMENT (НОВОЕ):
+        - BULLISH divergence (цена ↓, whale CVD ↑) + айсберг на BID → УСИЛИВАЕМ (+25%)
+        - BEARISH divergence (цена ↑, whale CVD ↓) + айсберг на ASK → УСИЛИВАЕМ (+25%)
+        - Айсберг ПРОТИВ дивергенции → СНИЖАЕМ (-15%)
         
         Args:
             base_confidence: Исходная уверенность из analyze_with_timing()
             gamma_profile: Текущий профиль гаммы от Deribit (может быть None)
             price: Цена айсберга
             is_ask: True если Ask (сопротивление), False если Bid (поддержка)
+            vpin_score: Текущий VPIN (0.0-1.0), или None если недостаточно данных
+            cvd_divergence: Tuple[is_divergence, div_type, confidence] из detect_cvd_divergence()
         
         Returns:
-            Tuple[adjusted_confidence, is_major_gamma_event]
+            Tuple[adjusted_confidence, is_major_event]
+            - adjusted_confidence: Модифицированная уверенность [0.0-1.0]
+            - is_major_event: True если это major event (gamma wall + CVD divergence)
         """
-        
-        # Если нет данных от Deribit - возвращаем без изменений
-        if gamma_profile is None:
-            return base_confidence, False
         
         adjusted = base_confidence
         is_major_event = False
         
-        # 1. Проверяем близость к Gamma Walls
-        price_float = float(price)
-        # WHY: Используем процентный толеранс из config (адаптируется к цене)
-        TOLERANCE = price_float * float(self.config.gamma_wall_tolerance_pct)
+        # === ФАЗА 1: GEX ADJUSTMENT ===
+        if gamma_profile is not None:
+            # 1. Проверяем близость к Gamma Walls
+            price_float = float(price)
+            # WHY: Используем процентный толеранс из config (адаптируется к цене)
+            TOLERANCE = price_float * float(self.config.gamma_wall_tolerance_pct)
+            
+            # 2. Определяем, стоим ли мы на стене
+            on_call_wall = abs(price_float - gamma_profile.call_wall) < TOLERANCE
+            on_put_wall = abs(price_float - gamma_profile.put_wall) < TOLERANCE
+            
+            is_on_gamma_wall = on_call_wall or on_put_wall
+            
+            # 3. ПОЛОЖИТЕЛЬНАЯ ГАММА: Дилеры гасят волатильность
+            if gamma_profile.total_gex > 0:
+                if is_on_gamma_wall:
+                    # Айсберг НА gamma wall при +GEX = максимальная надежность
+                    adjusted = adjusted * 1.8  # x1.8 multiplier
+                    is_major_event = True
+                else:
+                    # Обычный айсберг при +GEX = умеренное повышение
+                    adjusted = adjusted * 1.2  # x1.2 multiplier
+            
+            # 4. ОТРИЦАТЕЛЬНАЯ ГАММА: Gamma Squeeze режим
+            elif gamma_profile.total_gex < 0:
+                if is_on_gamma_wall:
+                    # Айсберг на gamma wall при -GEX = все еще значим, но менее надежен
+                    adjusted = adjusted * 1.3  # x1.3 (меньше чем при +GEX)
+                    is_major_event = True
+                else:
+                    # Обычный айсберг при -GEX = снижение надежности
+                    adjusted = adjusted * 0.75  # x0.75 (рынок нестабилен)
         
-        # 2. Определяем, стоим ли мы на стене
-        on_call_wall = abs(price_float - gamma_profile.call_wall) < TOLERANCE
-        on_put_wall = abs(price_float - gamma_profile.put_wall) < TOLERANCE
+        # === ФАЗА 2: VPIN ADJUSTMENT (НОВОЕ) ===
+        if vpin_score is not None:
+            # КРИТИЧНО: VPIN применяется ПОСЛЕ GEX adjustment
+            # WHY: GEX модифицирует структурный контекст, VPIN - краткосрочный риск
+            
+            # ТОКСИЧНЫЙ ПОТОК (VPIN > 0.7): Информированные агрессоры
+            # Риск пробоя айсберга ВЫСОКИЙ → СНИЖАЕМ confidence
+            if vpin_score > 0.7:
+                # Чем выше VPIN, тем сильнее снижение
+                # 0.7 → x0.85, 0.8 → x0.75, 0.9 → x0.65, 1.0 → x0.55
+                toxicity_multiplier = 1.0 - (vpin_score - 0.7) * 1.5  # Linear decay
+                toxicity_multiplier = max(0.55, toxicity_multiplier)  # Floor at 0.55
+                adjusted = adjusted * toxicity_multiplier
+            
+            # ШУМНЫЙ ПОТОК (VPIN < 0.3): Розничные трейдеры
+            # Айсберг УСТОИТ → ПОВЫШАЕМ confidence
+            elif vpin_score < 0.3:
+                # Чем ниже VPIN, тем сильнее повышение
+                # 0.3 → x1.05, 0.2 → x1.10, 0.1 → x1.15, 0.0 → x1.20
+                noise_multiplier = 1.0 + (0.3 - vpin_score) * 0.67  # Linear growth
+                noise_multiplier = min(1.20, noise_multiplier)  # Cap at 1.20
+                adjusted = adjusted * noise_multiplier
+            
+            # НЕЙТРАЛЬНЫЙ ПОТОК (0.3 <= VPIN <= 0.7): Не модифицируем
         
-        is_on_gamma_wall = on_call_wall or on_put_wall
+        # === ФАЗА 3: CVD DIVERGENCE ADJUSTMENT (НОВОЕ) ===
+        if cvd_divergence is not None:
+            is_div, div_type, div_confidence = cvd_divergence
+            
+            if is_div and div_confidence > 0.5:
+                # BULLISH DIVERGENCE (накопление): Цена падает, Whale CVD растёт
+                # Если айсберг на BID (поддержка) → УСИЛИВАЕМ
+                if div_type == 'BULLISH' and not is_ask:
+                    cvd_multiplier = 1.0 + (div_confidence * 0.25)  # До +25%
+                    adjusted = adjusted * cvd_multiplier
+                    is_major_event = True  # CVD дивергенция = major event
+                
+                # BEARISH DIVERGENCE (дистрибуция): Цена растёт, Whale CVD падает
+                # Если айсберг на ASK (сопротивление) → УСИЛИВАЕМ
+                elif div_type == 'BEARISH' and is_ask:
+                    cvd_multiplier = 1.0 + (div_confidence * 0.25)  # До +25%
+                    adjusted = adjusted * cvd_multiplier
+                    is_major_event = True
+                
+                # Если айсберг ПРОТИВ дивергенции → СНИЖАЕМ
+                # BULLISH divergence но айсберг на ASK = противоречие
+                elif div_type == 'BULLISH' and is_ask:
+                    cvd_multiplier = 1.0 - (div_confidence * 0.15)  # До -15%
+                    adjusted = adjusted * cvd_multiplier
+                
+                # BEARISH divergence но айсберг на BID = противоречие
+                elif div_type == 'BEARISH' and not is_ask:
+                    cvd_multiplier = 1.0 - (div_confidence * 0.15)  # До -15%
+                    adjusted = adjusted * cvd_multiplier
         
-        # 3. ПОЛОЖИТЕЛЬНАЯ ГАММА: Дилеры гасят волатильность
-        if gamma_profile.total_gex > 0:
-            if is_on_gamma_wall:
-                # Айсберг НА gamma wall при +GEX = максимальная надежность
-                adjusted = base_confidence * 1.8  # x1.8 multiplier
-                is_major_event = True
-            else:
-                # Обычный айсберг при +GEX = умеренное повышение
-                adjusted = base_confidence * 1.2  # x1.2 multiplier
-        
-        # 4. ОТРИЦАТЕЛЬНАЯ ГАММА: Gamma Squeeze режим
-        elif gamma_profile.total_gex < 0:
-            if is_on_gamma_wall:
-                # Айсберг на gamma wall при -GEX = все еще значим, но менее надежен
-                adjusted = base_confidence * 1.3  # x1.3 (меньше чем при +GEX)
-                is_major_event = True
-            else:
-                # Обычный айсберг при -GEX = снижение надежности
-                adjusted = base_confidence * 0.75  # x0.75 (рынок нестабилен)
-        
-        # 5. Обрезаем до [0.0, 1.0]
+        # === ФИНАЛИЗАЦИЯ ===
+        # Обрезаем до [0.0, 1.0]
         adjusted = max(0.0, min(1.0, adjusted))
         
         return adjusted, is_major_event
+    
+    def _is_vpin_reliable(self, book: LocalOrderBook) -> bool:
+        """
+        WHY: Проверяет надежность VPIN в текущих рыночных условиях.
+        
+        VPIN может давать ложные сигналы в:
+        1. Флэте (низкая волатильность) - маркет-мейкеры создают псевдо-имбаланс
+        2. Низкой ликвидности (< 100 сделок/мин) - недостаточно данных
+        3. Экстремальной волатильности (> 5%) - шум перебивает сигнал
+        
+        Теория:
+        - VPIN из TradFi (Easley 2012) предполагает "нормальные" условия
+        - Во флэте VPIN ошибочно показывает "токсичность" от MM-ботов
+        - При низкой ликвидности bucket_size слишком велик
+        
+        Args:
+            book: LocalOrderBook с метриками
+        
+        Returns:
+            True если VPIN можно доверять, False если рискованно
+        """
+        # 1. Проверка ликвидности
+        # WHY: Минимум 100 сделок за последнюю минуту для статистики
+        if book.trade_count < 100:
+            return False  # Недостаточно данных
+        
+        # 2. Проверка волатильности (защита от флэта)
+        # WHY: Во флэте (<1% волатильность) VPIN дает ложные сигналы
+        mid_price = book.get_mid_price()
+        if mid_price:
+            # Простая эвристика: проверяем spread
+            if book.best_bid and book.best_ask:
+                spread_pct = float((book.best_ask - book.best_bid) / mid_price) * 100
+                
+                # Если spread < 0.01% = мертвый флэт (для BTC)
+                # Адаптируем под токен через config
+                min_spread_threshold = 0.01  # 1 basis point
+                if spread_pct < min_spread_threshold:
+                    return False  # Слишком узкий спред = флэт
+        
+        # 3. Проверка экстремальной волатильности
+        # WHY: При >5% волатильности VPIN перенасыщен шумом
+        # TODO: Добавить когда будет реализована volatility_1h в book
+        # if hasattr(book, 'volatility_1h') and book.volatility_1h > 5.0:
+        #     return False
+        
+        # 4. Все проверки пройдены
+        return True
+    
+    def classify_intention(self, hidden_volume: Decimal, adv_20d: Optional[Decimal] = None) -> str:
+        """
+        WHY: Классифицирует айсберг по его размеру относительно рынка (IIR).
+        
+        Args:
+            hidden_volume: Скрытый объем айсберга
+            adv_20d: Средний дневной объем (Average Daily Volume)
+            
+        Returns:
+            'SCALPER' | 'INTRADAY' | 'POSITIONAL' | 'UNKNOWN'
+        """
+        # Защита от отсутствия данных
+        if adv_20d is None or adv_20d == 0:
+            return "UNKNOWN"
+            
+        # Расчет Impact Ratio
+        iir = hidden_volume / adv_20d
+        
+        # Эвристики из Research Paper
+        if iir < Decimal("0.0001"):  # < 0.01%
+            return "SCALPER"    # Шум/Маркет-мейкинг
+        elif iir < Decimal("0.001"):  # < 0.1%
+            return "INTRADAY"   # Алго-исполнение
+        else:
+            return "POSITIONAL"  # Smart Money Accumulation (>= 0.1%)
 
 class WhaleAnalyzer:
     """
@@ -876,21 +1043,39 @@ class AccumulationDetector:
     - LocalOrderBook.cluster_icebergs_to_zones() для корреляции
     """
     
-    def __init__(self, book: LocalOrderBook):
+    def __init__(self, book: LocalOrderBook, config: AssetConfig):
         """
         Args:
             book: LocalOrderBook с historical_memory и active_icebergs
+            config: AssetConfig для мульти-ассет поддержки (Gemini Fix)
         """
         self.book = book
+        self.config = config  # FIX: Gemini Validation - мульти-ассет пороги
+        
+        # === НОВОЕ: КЕШ ДЛЯ O(1) ДОСТУПА (Gemini Fix) ===
+        # WHY: Предотвращает пересчет дивергенции на каждой сделке
+        # Обновляется раз в 30 секунд через detect_accumulation_multi_timeframe()
+        self._cached_divergence_state: Optional[dict] = None
+        
+        # === GEMINI RECOMMENDATION 1: Thread Safety ===
+        # WHY: Защита кеша от race conditions при параллельных запросах
+        self._cache_lock = asyncio.Lock()
+        
+        # === GEMINI RECOMMENDATION 2: Memory Management ===
+        # WHY: Храним зоны для очистки (cleanup task)
+        # Dict[Tuple[Decimal, bool], dict] - key: (price, is_ask)
+        self.price_zones: dict = {}
     
     def detect_accumulation(self, timeframe: str = '1h') -> Optional[dict]:
         """
         WHY: Детектирует накопление/дистрибуцию на заданном таймфрейме.
         
+        === DIGITAL WYCKOFF IMPLEMENTATION ===
         Логика:
-        1. Проверяем CVD дивергенцию через historical_memory
-        2. Если дивергенция есть → проверяем близость к айсберг-зонам
-        3. Рассчитываем confidence (базовая + бонус за зону)
+        1. DIVERGENCE CHECK: Проверяем CVD дивергенцию (Price vs Whale/Minnow)
+        2. ABSORPTION CHECK: Проверяем пассивное поглощение айсбергами
+        3. TRAP CHECK: Проверяем Weighted OBI для ложных пробоев
+        4. ZONE CORRELATION: Проверяем близость к сильным зонам
         
         Args:
             timeframe: '1h', '4h', '1d', или '1w'
@@ -901,18 +1086,20 @@ class AccumulationDetector:
             - timeframe: str
             - confidence: float (0.0-1.0)
             - near_strong_zone: bool
-            - zone_price: Optional[Decimal] (цена ближайшей зоны)
+            - zone_price: Optional[Decimal]
+            - wyckoff_pattern: str ('SPRING', 'UPTHRUST', 'ACCUMULATION', 'DISTRIBUTION')
+            - absorption_detected: bool
+            - obi_confirms: bool
             
             Или None если дивергенции нет
         """
-        # 1. Проверяем дивергенцию
+        # === 1. DIVERGENCE CHECK (уже реализовано) ===
         is_divergence, div_type = self.book.historical_memory.detect_cvd_divergence(timeframe)
         
         if not is_divergence:
             return None
         
-        # 2. Базовая confidence зависит от таймфрейма
-        # Старшие таймфреймы = выше confidence
+        # Базовая confidence зависит от таймфрейма
         base_confidence = {
             '1h': 0.5,
             '4h': 0.6,
@@ -920,45 +1107,204 @@ class AccumulationDetector:
             '1w': 0.8
         }.get(timeframe, 0.5)
         
-        # 3. Проверяем корреляцию с айсберг-зонами
+        # === 2. ABSORPTION CHECK (НОВОЕ - Wyckoff) ===
+        absorption_detected = self._check_passive_absorption(div_type)
+        if absorption_detected:
+            base_confidence += 0.15  # Бонус за подтверждение поглощения
+        
+        # === 3. TRAP CHECK (НОВОЕ - Wyckoff) ===
+        obi_confirms = self._check_weighted_obi(div_type)
+        if obi_confirms:
+            base_confidence += 0.10  # Бонус за подтверждение OBI
+        
+        # === 4. ZONE CORRELATION (улучшено) ===
         zones = self.book.cluster_icebergs_to_zones()
         current_price = self.book.get_mid_price()
-        
-        # WHY: Если стакан пустой → корреляция с зонами невозможна (нет текущей цены)
-        # В production это не происходит (стакан всегда заполнен)
         
         near_strong_zone = False
         zone_price = None
         
         if current_price and zones:
             # Ищем ближайшую сильную зону (подходящего типа)
-            # BULLISH дивергенция → ищем BID зоны (поддержка)
-            # BEARISH дивергенция → ищем ASK зоны (сопротивление)
             is_ask_zone = (div_type == 'BEARISH')
-            
             relevant_zones = [z for z in zones if z.is_ask == is_ask_zone and z.is_strong()]
             
             if relevant_zones:
-                # Находим ближайшую зону
                 closest_zone = min(relevant_zones, 
                                  key=lambda z: abs(float(z.center_price - current_price)))
                 
                 distance_pct = abs(float(closest_zone.center_price - current_price) / float(current_price)) * 100
                 
-                # Если расстояние < 0.5% → считаем что рядом
                 if distance_pct < 0.5:
                     near_strong_zone = True
                     zone_price = closest_zone.center_price
-                    # Бонус к confidence +0.2
-                    base_confidence = min(1.0, base_confidence + 0.2)
+                    base_confidence += 0.15  # Бонус за зону (увеличен с 0.2)
+        
+        # === 5. WYCKOFF PATTERN CLASSIFICATION ===
+        wyckoff_pattern = self._classify_wyckoff_pattern(
+            div_type=div_type,
+            absorption=absorption_detected,
+            obi_confirms=obi_confirms,
+            near_zone=near_strong_zone
+        )
+        
+        # Обрезаем confidence до [0.0, 1.0]
+        final_confidence = min(1.0, base_confidence)
         
         return {
             'type': div_type,
             'timeframe': timeframe,
-            'confidence': base_confidence,
+            'confidence': final_confidence,
             'near_strong_zone': near_strong_zone,
-            'zone_price': zone_price
+            'zone_price': zone_price,
+            'wyckoff_pattern': wyckoff_pattern,
+            'absorption_detected': absorption_detected,
+            'obi_confirms': obi_confirms
         }
+    
+    def _check_passive_absorption(self, div_type: str) -> bool:
+        """
+        WHY: Wyckoff "Spring" detection - пассивное поглощение.
+        
+        Теория (документ Gemini):
+        - BULLISH: Цена падает, Minnow CVD падает (паника)
+          НО при этом на стороне BID есть крупные айсберги
+          → Это "Spring" (пружина) - киты поглощают панические продажи
+        
+        - BEARISH: Цена растет, Minnow CVD растет (жадность)
+          НО при этом на стороне ASK есть крупные айсберги
+          → Это "Upthrust" (ложный пробой) - киты разгружаются
+        
+        Args:
+            div_type: 'BULLISH' или 'BEARISH'
+        
+        Returns:
+            True если найдены айсберги на правильной стороне
+        """
+        # BULLISH: Ищем крупные BID-айсберги (поддержка)
+        if div_type == 'BULLISH':
+            # === FIX: Gemini Validation - порог из config (мульти-ассет) ===
+            # WHY: Без near_zone (кластера) нужен крупный айсберг для SPRING
+            # Теория: R_abs = total/visible. Если total=threshold, visible=threshold/10 → R_abs=10 (кит)
+            # Порог: BTC=2.0, ETH=30.0, SOL=500.0 (адаптируется под токен)
+            large_bid_icebergs = [
+                ice for ice in self.book.active_icebergs.values()
+                if not ice.is_ask  # BID-сторона
+                and ice.confidence_score > 0.7  # Высокая уверенность
+                and float(ice.total_hidden_volume) > float(self.config.accumulation_whale_threshold)
+            ]
+            return len(large_bid_icebergs) > 0
+        
+        # BEARISH: Ищем крупные ASK-айсберги (сопротивление)
+        elif div_type == 'BEARISH':
+            # === FIX: Gemini Validation - порог из config (мульти-ассет) ===
+            large_ask_icebergs = [
+                ice for ice in self.book.active_icebergs.values()
+                if ice.is_ask  # ASK-сторона
+                and ice.confidence_score > 0.7
+                and float(ice.total_hidden_volume) > float(self.config.accumulation_whale_threshold)
+            ]
+            return len(large_ask_icebergs) > 0
+        
+        return False
+    
+    def _check_weighted_obi(self, div_type: str) -> bool:
+        """
+        WHY: Wyckoff "Effort vs Result" - проверка Weighted OBI.
+        
+        Теория (документ Gemini):
+        - BULLISH: Цена падает, НО OBI растет (лимитная поддержка усиливается)
+          → Это накопление, а не реальное падение
+        
+        - BEARISH: Цена растет, НО OBI падает (лимитное сопротивление усиливается)
+          → Это дистрибуция, а не реальный рост
+        
+        Args:
+            div_type: 'BULLISH' или 'BEARISH'
+        
+        Returns:
+            True если OBI подтверждает дивергенцию
+        """
+        # Рассчитываем Weighted OBI (с затуханием по глубине)
+        weighted_obi = self.book.get_weighted_obi(depth=10)
+        
+        # BULLISH: OBI должен быть положительным (давление покупателей)
+        if div_type == 'BULLISH':
+            return weighted_obi > 0.2  # Порог 20% дисбаланса
+        
+        # BEARISH: OBI должен быть отрицательным (давление продавцов)
+        elif div_type == 'BEARISH':
+            return weighted_obi < -0.2  # Порог -20%
+        
+        return False
+    
+    def _classify_wyckoff_pattern(
+        self,
+        div_type: str,
+        absorption: bool,
+        obi_confirms: bool,
+        near_zone: bool
+    ) -> str:
+        """
+        WHY: Классификация паттерна Wyckoff.
+        
+        FIX (Task: Gemini Validation): Смягчили требования SPRING/UPTHRUST.
+        
+        ТЕОРИЯ (документ "Анализ смарт-мани", раздел 2.1):
+        - SPRING = дивергенция + пассивное поглощение (absorption) + OBI подтверждение
+        - "Один крупный айсберг (R_abs > 10) УЖЕ является сильным уровнем"
+        - near_zone (кластер из 3+ айсбергов) - это БОНУС, но НЕ обязательное условие
+        
+        Решающее дерево:
+        - BULLISH + Absorption + OBI → 'SPRING' (лучший сигнал)
+        - BULLISH без подтверждения → 'ACCUMULATION' (слабее)
+        - BEARISH + Absorption + OBI → 'UPTHRUST' (ложный пробой)
+        - BEARISH без подтверждения → 'DISTRIBUTION'
+        
+        Args:
+            div_type: 'BULLISH' или 'BEARISH'
+            absorption: Поглощение обнаружено?
+            obi_confirms: OBI подтверждает?
+            near_zone: Рядом с сильной зоной? (опциональный усилитель)
+        
+        Returns:
+            'SPRING', 'UPTHRUST', 'ACCUMULATION', или 'DISTRIBUTION'
+        """
+        if div_type == 'BULLISH':
+            # FIX: Достаточно Absorption + OBI. Zone - опциональный бонус.
+            # WHY: Один крупный айсберг (5 BTC) = уже сильная защита уровня
+            if absorption and obi_confirms:
+                return 'SPRING'
+            return 'ACCUMULATION'
+        
+        elif div_type == 'BEARISH':
+            # FIX: Достаточно Absorption + OBI
+            if absorption and obi_confirms:
+                return 'UPTHRUST'
+            return 'DISTRIBUTION'
+        
+        return 'UNKNOWN'
+    
+    def get_current_divergence_state(self) -> Optional[dict]:
+        """
+        WHY: O(1) доступ к последнему результату дивергенции (КЕШ).
+        
+        === GEMINI FIX: Data Fusion Architecture ===
+        Предотвращает пересчет дивергенции на каждой сделке (1000+ TPS).
+        Кеш обновляется раз в 30 секунд через detect_accumulation_multi_timeframe().
+        
+        Используется в services.py при TradeEvent для захвата контекста.
+        
+        Returns:
+            dict или None:
+            {
+                'type': 'BULLISH' | 'BEARISH',
+                'confidence': float,
+                'timeframe': str,  # Наиболее сильный таймфрейм
+                'wyckoff_pattern': str
+            }
+        """
+        return self._cached_divergence_state
     
     def detect_accumulation_multi_timeframe(self) -> dict:
         """
@@ -967,6 +1313,9 @@ class AccumulationDetector:
         Логика:
         - Проверяем 1H, 4H, 1D, 1W
         - Возвращаем только те таймфреймы, где есть дивергенция
+        
+        === GEMINI FIX: Обновляет кеш ===
+        После анализа сохраняет наиболее сильный сигнал в _cached_divergence_state.
         
         Returns:
             dict: {
@@ -983,4 +1332,360 @@ class AccumulationDetector:
             if result is not None:
                 results[tf] = result
         
+        # === GEMINI FIX: ОБНОВЛЕНИЕ КЕША ===
+        # WHY: Выбираем наиболее сильный сигнал (высший таймфрейм = больше вес)
+        if results:
+            # Приоритет: 1W > 1D > 4H > 1H
+            for priority_tf in ['1w', '1d', '4h', '1h']:
+                if priority_tf in results:
+                    self._cached_divergence_state = results[priority_tf]
+                    break
+        else:
+            # Нет дивергенции - очищаем кеш
+            self._cached_divergence_state = None
+        
         return results
+    
+    def _periodic_cleanup_task(self):
+        """
+        WHY: Очищает старые зоны из памяти.
+        
+        === GEMINI RECOMMENDATION 2: Memory Management ===
+        Логирует удаляемые "тяжёлые" зоны для отслеживания утечек памяти.
+        
+        Логика:
+        - Удаляем зоны старше 30 минут
+        - Логируем количество айсбергов и уровень цен
+        """
+        logger = logging.getLogger(__name__)
+        cutoff_time = datetime.now() - timedelta(minutes=30)
+        
+        zones_to_remove = []
+        for zone_id, zone_data in self.price_zones.items():
+            if zone_data['created_at'] < cutoff_time:
+                zones_to_remove.append(zone_id)
+        
+        # Логирование удаления
+        if zones_to_remove:
+            for zone_id in zones_to_remove:
+                zone_data = self.price_zones[zone_id]
+                price, is_ask = zone_id
+                num_icebergs = len(zone_data.get('icebergs', []))
+                
+                logger.info(
+                    f"Removed PriceZone: price={price}, "
+                    f"side={'ASK' if is_ask else 'BID'}, "
+                    f"icebergs={num_icebergs}"
+                )
+                
+                # Удаляем зону
+                del self.price_zones[zone_id]
+        else:
+            # Нет удалений - не логируем (избегаем спама)
+            pass
+
+
+# ===========================================================================
+# НОВЫЙ КЛАСС: FlowToxicityAnalyzer (Task: VPIN Implementation)
+# ===========================================================================
+
+class FlowToxicityAnalyzer:
+    """
+    WHY: Анализатор токсичности потока на основе VPIN.
+    
+    Теория (Easley-O'Hara, 2012 - документ "Анализ данных смарт-мани"):
+    - VPIN = Volume-Synchronized Probability of Informed Trading
+    - Измеряет вероятность того, что агрессоры информированы (знают будущее движение)
+    - Высокий VPIN (>0.7) = токсичный поток → риск пробоя айсберга
+    - Низкий VPIN (<0.3) = шумный поток → айсберг устоит
+    
+    Формула:
+    VPIN = Σ|Buy_i - Sell_i| / (n * bucket_size)
+    
+    Где:
+    - Buy_i, Sell_i = объёмы в корзине i
+    - n = количество корзин (window_size, обычно 50)
+    - bucket_size = фиксированный размер корзины (например 10 BTC)
+    """
+    
+    def __init__(self, book: LocalOrderBook, bucket_size: Decimal):
+        """
+        Args:
+            book: LocalOrderBook с vpin_buckets и current_vpin_bucket
+            bucket_size: Размер корзины в монетах токена (например Decimal("10") для BTC)
+        """
+        self.book = book
+        self.bucket_size = bucket_size
+        
+        # WHY: Инициализируем первую корзину если её нет
+        if self.book.current_vpin_bucket is None:
+            self.book.current_vpin_bucket = VolumeBucket(
+                bucket_size=bucket_size,
+                symbol=book.symbol
+            )
+    
+    def update_vpin(self, trade: TradeEvent) -> Optional[float]:
+        """
+        WHY: Обновляет VPIN при каждой сделке.
+        
+        Логика:
+        1. Добавляем сделку в current_bucket
+        2. Если bucket заполнен → перемещаем в историю, создаём новый
+        3. Пересчитываем VPIN на основе скользящего окна
+        
+        Args:
+            trade: Событие сделки
+        
+        Returns:
+            float: Текущий VPIN (0.0-1.0), или None если недостаточно корзин
+        """
+        # 1. Добавляем сделку в текущую корзину
+        overflow = self.book.current_vpin_bucket.add_trade(trade)
+        
+        # 2. Если корзина заполнена
+        if self.book.current_vpin_bucket.is_complete:
+            # Сохраняем в историю
+            self.book.vpin_buckets.append(self.book.current_vpin_bucket)
+            
+            # Если есть overflow → создаём новую корзину с этим overflow
+            if overflow > 0:
+                # Создаём новую корзину
+                new_bucket = VolumeBucket(
+                    bucket_size=self.bucket_size,
+                    symbol=self.book.symbol
+                )
+                
+                # Создаём trade-событие для overflow
+                overflow_trade = TradeEvent(
+                    price=trade.price,
+                    quantity=overflow,
+                    is_buyer_maker=trade.is_buyer_maker,
+                    event_time=trade.event_time,
+                    trade_id=trade.trade_id
+                )
+                
+                # Добавляем overflow в новую корзину
+                new_bucket.add_trade(overflow_trade)
+                self.book.current_vpin_bucket = new_bucket
+            else:
+                # Просто создаём пустую корзину
+                self.book.current_vpin_bucket = VolumeBucket(
+                    bucket_size=self.bucket_size,
+                    symbol=self.book.symbol
+                )
+        
+        # 3. Пересчитываем VPIN
+        vpin = self.get_current_vpin()
+        
+        # === GEMINI RECOMMENDATION 3: VPIN Reliable Check ===
+        # WHY: Возвращаем None если VPIN unreliable
+        if vpin is not None and not self._is_vpin_reliable():
+            return None
+        
+        return vpin
+    
+    def get_current_vpin(self) -> Optional[float]:
+        """
+        WHY: Рассчитывает текущий VPIN на основе истории корзин.
+        
+        Формула:
+        VPIN = Σ|Buy_i - Sell_i| / (n * bucket_size)
+        
+        Returns:
+            float: VPIN значение (0.0-1.0), или None если корзин < 10
+        """
+        # WHY: Минимум 10 корзин для надёжного расчёта
+        if len(self.book.vpin_buckets) < 10:
+            return None
+        
+        # Считаем сумму дисбалансов
+        total_imbalance = sum(
+            bucket.calculate_imbalance() 
+            for bucket in self.book.vpin_buckets
+        )
+        
+        # Знаменатель формулы
+        n = len(self.book.vpin_buckets)
+        denominator = n * self.bucket_size
+        
+        # Защита от деления на 0
+        if denominator == 0:
+            return None
+        
+        vpin = float(total_imbalance / denominator)
+        
+        # Обрезаем до [0.0, 1.0]
+        return max(0.0, min(1.0, vpin))
+    
+    def is_flow_toxic(self, threshold: float = 0.7) -> bool:
+        """
+        WHY: Проверяет токсичность потока.
+        
+        Теория:
+        - VPIN > 0.7 = токсичный поток (информированные агрессоры)
+        - Риск пробоя айсберга высокий
+        
+        Args:
+            threshold: Порог токсичности (default 0.7)
+        
+        Returns:
+            True если поток токсичный
+        """
+        vpin = self.get_current_vpin()
+        if vpin is None:
+            return False
+        return vpin > threshold
+    
+    def get_toxicity_level(self) -> str:
+        """
+        WHY: Возвращает категориальный уровень токсичности.
+        
+        Levels:
+        - EXTREME: VPIN > 0.8 (критический риск пробоя)
+        - HIGH: VPIN > 0.7 (высокий риск)
+        - MODERATE: VPIN 0.5-0.7 (умеренный)
+        - LOW: VPIN 0.3-0.5 (низкий)
+        - MINIMAL: VPIN < 0.3 (минимальный, шумный поток)
+        - UNKNOWN: Недостаточно данных
+        
+        Returns:
+            str: Уровень токсичности
+        """
+        vpin = self.get_current_vpin()
+        
+        if vpin is None:
+            return 'UNKNOWN'
+        
+        if vpin > 0.8:
+            return 'EXTREME'
+        elif vpin > 0.7:
+            return 'HIGH'
+        elif vpin > 0.5:
+            return 'MODERATE'
+        elif vpin > 0.3:
+            return 'LOW'
+        else:
+            return 'MINIMAL'
+    
+    def _is_vpin_reliable(self) -> bool:
+        """
+        WHY: Проверяет надёжность VPIN в текущих рыночных условиях.
+        
+        === GEMINI RECOMMENDATION 3: VPIN Reliable Check ===
+        Фильтрует "флэтовые" сигналы где VPIN шумный.
+        
+        VPIN может давать ложные сигналы в:
+        1. Флэте (низкая волатильность) - маркет-мейкеры создают псевдо-имбаланс
+        2. Недостаточно данных (< 10 корзин)
+        
+        Теория (документ "Анализ смарт-мани"):
+        - VPIN из TradFi (Easley 2012) предполагает "нормальные" условия
+        - Во флэте VPIN ошибочно показывает "токсичность" от MM-ботов
+        - При низкой ликвидности bucket_size слишком велик
+        
+        Returns:
+            True если VPIN можно доверять, False если рискованно
+        """
+        # 1. Проверка наличия данных
+        # WHY: Минимум 10 корзин для надёжного расчёта
+        if len(self.book.vpin_buckets) < 10:
+            return False  # Недостаточно данных
+        
+        # 2. Проверка флэта (низкая волатильность)
+        # WHY: Во флэте Buy ≈ Sell в каждой корзине = VPIN даёт ложные сигналы
+        total_imbalance = sum(
+            bucket.calculate_imbalance() 
+            for bucket in self.book.vpin_buckets
+        )
+        
+        # Если общий дисбаланс очень мал (< 5% от общего объёма) = флэт
+        total_volume = len(self.book.vpin_buckets) * self.bucket_size
+        if total_volume > 0:
+            imbalance_ratio = float(total_imbalance / total_volume)
+            if imbalance_ratio < 0.05:  # Меньше 5% = флэт
+                return False
+        
+        # 3. Все проверки пройдены
+        return True
+
+
+# ===========================================================================
+# GAMMA PROVIDER: Извлечение GEX метрик из LocalOrderBook
+# ===========================================================================
+
+class GammaProvider:
+    """
+    WHY: Читает GEX данные из LocalOrderBook.gamma_profile.
+    
+    Интерфейс:
+    - get_total_gex() → суммарная гамма-экспозиция
+    - get_gamma_wall_distance(price) → расстояние до ближайшей стены
+    """
+    
+    def __init__(self, order_book):
+        """
+        Args:
+            order_book: LocalOrderBook с gamma_profile
+        """
+        self.book = order_book
+    
+    def get_total_gex(self) -> Optional[float]:
+        """
+        WHY: Возвращает суммарную gamma exposure.
+        
+        Returns:
+            float: Суммарная GEX (может быть + или -)
+            None: Если данных нет
+        """
+        if not self.book or not self.book.gamma_profile:
+            return None
+        
+        try:
+            return float(self.book.gamma_profile.total_gex)
+        except:
+            return None
+    
+    def get_gamma_wall_distance(self, current_price: float) -> Tuple[Optional[float], Optional[str]]:
+        """
+        WHY: Рассчитывает расстояние до ближайшей gamma wall.
+        
+        Теория (документ "Анализ данных смарт-мани"):
+        - Gamma Wall = страйк с максимальной концентрацией гаммы
+        - Call Wall = сопротивление (дилеры продают на росте)
+        - Put Wall = поддержка (дилеры покупают на падении)
+        
+        Args:
+            current_price: Текущая цена актива
+        
+        Returns:
+            Tuple[distance_pct, wall_type]:
+            - distance_pct: Процентное расстояние до ближайшей wall
+            - wall_type: 'CALL' | 'PUT' | None
+        """
+        if not self.book or not self.book.gamma_profile:
+            return None, None
+        
+        try:
+            gamma_profile = self.book.gamma_profile
+            
+            # Расстояния до стен
+            dist_to_call = abs(current_price - gamma_profile.call_wall)
+            dist_to_put = abs(current_price - gamma_profile.put_wall)
+            
+            # Находим ближайшую
+            if dist_to_call < dist_to_put:
+                closest_wall = gamma_profile.call_wall
+                wall_type = 'CALL'
+                distance = dist_to_call
+            else:
+                closest_wall = gamma_profile.put_wall
+                wall_type = 'PUT'
+                distance = dist_to_put
+            
+            # Процентное расстояние
+            distance_pct = (distance / current_price) * 100
+            
+            return float(distance_pct), wall_type
+            
+        except:
+            return None, None

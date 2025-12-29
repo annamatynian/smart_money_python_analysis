@@ -1,0 +1,224 @@
+# ============================================
+# Docker Compose для Oracle Cloud ARM64 (6GB RAM)
+# Production-ready configuration с оптимизацией памяти
+# ============================================
+
+version: '3.8'
+
+services:
+  # ============ PostgreSQL 15 + TimescaleDB ============
+  db:
+    image: timescale/timescaledb:latest-pg15
+    # WHY: TimescaleDB нужен для smart_candles (time-series optimization)
+    
+    container_name: smart_money_db
+    restart: unless-stopped
+    
+    # === КРИТИЧНО: Настройки памяти для 6GB машины ===
+    shm_size: '1gb'
+    # WHY: Shared memory для параллельных запросов и сортировок
+    # 1GB = оптимально для 6GB total RAM (PostgreSQL нужно ~17% от RAM для shm)
+    
+    command: >
+      postgres
+      -c shared_buffers=1536MB
+      -c work_mem=32MB
+      -c maintenance_work_mem=256MB
+      -c effective_cache_size=3GB
+      -c max_connections=20
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c max_worker_processes=4
+      -c max_parallel_workers_per_gather=2
+      -c max_parallel_workers=4
+      -c wal_buffers=16MB
+      -c checkpoint_completion_target=0.9
+      -c log_timezone='UTC'
+      -c timezone='UTC'
+    # WHY: Параметры оптимизированы для 6GB RAM:
+    # - shared_buffers=1536MB (25% от 6GB) - основной кеш PostgreSQL
+    # - work_mem=32MB - память на одну операцию сортировки/хеша (20 коннектов × 32MB = 640MB max)
+    # - maintenance_work_mem=256MB - для VACUUM, CREATE INDEX
+    # - effective_cache_size=3GB - подсказка планировщику (50% от RAM)
+    # - max_connections=20 - ограничиваем чтобы не съесть всю RAM
+    
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-smart_money_db}
+      POSTGRES_USER: ${POSTGRES_USER:-trader}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_in_production}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      # WHY: PGDATA в подпапке для совместимости с volume permissions
+    
+    volumes:
+      - ./pg_data:/var/lib/postgresql/data
+      # WHY: Персистентное хранилище данных
+      # ВАЖНО: На Oracle Cloud создать директорию: mkdir -p pg_data && chmod 700 pg_data
+      
+      - ./migrations:/docker-entrypoint-initdb.d
+      # WHY: Автоматическое применение миграций при первом запуске
+      # ОПЦИОНАЛЬНО: Можно убрать если миграции применяются вручную
+    
+    ports:
+      - "5432:5432"
+      # WHY: Открываем порт для внешнего доступа (можно закрыть в production)
+    
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trader} -d ${POSTGRES_DB:-smart_money_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    
+    networks:
+      - smart_money_net
+    
+    # === Ограничения ресурсов (критично для 6GB машины!) ===
+    deploy:
+      resources:
+        limits:
+          memory: 3500M
+          # WHY: Жёсткий лимит чтобы PostgreSQL не убил весь сервер
+          # 3.5GB для базы + 2GB для app + 0.5GB для OS = 6GB total
+        reservations:
+          memory: 2048M
+          # WHY: Минимум для стабильной работы базы
+
+
+  # ============ Trading Application (HFT Engine) ============
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # WHY: Собираем из локального Dockerfile (multi-stage для ARM64)
+    
+    container_name: smart_money_app
+    restart: unless-stopped
+    
+    depends_on:
+      db:
+        condition: service_healthy
+    # WHY: Ждём пока база полностью запустится
+    
+    env_file:
+      - .env
+    # WHY: Секреты и конфиги из .env файла
+    
+    environment:
+      # Database connection
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: ${POSTGRES_DB:-smart_money_db}
+      DB_USER: ${POSTGRES_USER:-trader}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-changeme_in_production}
+      
+      # Application settings
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      
+      # Binance API (из .env)
+      BINANCE_API_KEY: ${BINANCE_API_KEY}
+      BINANCE_API_SECRET: ${BINANCE_API_SECRET}
+      
+      # Deribit API (опционально)
+      DERIBIT_API_KEY: ${DERIBIT_API_KEY:-}
+      DERIBIT_API_SECRET: ${DERIBIT_API_SECRET:-}
+    
+    volumes:
+      - ./logs:/app/logs
+      # WHY: Персистентные логи для анализа
+      
+      # - ./config.yaml:/app/config.yaml:ro
+      # WHY: Опционально - конфиг файл (read-only)
+    
+    networks:
+      - smart_money_net
+    
+    # === Ограничения ресурсов ===
+    deploy:
+      resources:
+        limits:
+          memory: 2048M
+          # WHY: 2GB для приложения (asyncio + WebSocket buffers + OBI/OFI calculations)
+        reservations:
+          memory: 1024M
+    
+    # Healthcheck (опционально - добавить HTTP endpoint в будущем)
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+    #   interval: 30s
+    #   timeout: 10s
+    #   retries: 3
+    #   start_period: 40s
+
+
+  # ============ ОПЦИОНАЛЬНО: pgAdmin (для дебага) ============
+  # Раскомментировать если нужен веб-интерфейс для базы
+  # pgadmin:
+  #   image: dpage/pgadmin4:latest
+  #   container_name: smart_money_pgadmin
+  #   restart: unless-stopped
+  #   environment:
+  #     PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@smartmoney.local}
+  #     PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+  #   ports:
+  #     - "5050:80"
+  #   networks:
+  #     - smart_money_net
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         memory: 512M
+
+
+networks:
+  smart_money_net:
+    driver: bridge
+    # WHY: Изолированная сеть для сервисов
+
+
+volumes:
+  pg_data:
+    # WHY: Named volume для базы (опционально - можно использовать bind mount)
+    driver: local
+
+
+# ============================================
+# DEPLOYMENT COMMANDS (Oracle Cloud ARM64)
+# ============================================
+#
+# 1. Подготовка сервера:
+#    sudo apt update && sudo apt install -y docker.io docker-compose
+#    sudo usermod -aG docker $USER  # Добавить текущего юзера в группу docker
+#    newgrp docker  # Применить изменения
+#
+# 2. Создать .env файл (скопировать из .env.example):
+#    cp .env.example .env
+#    nano .env  # Заполнить API ключи
+#
+# 3. Создать директорию для базы:
+#    mkdir -p pg_data logs
+#    chmod 700 pg_data
+#
+# 4. Запустить систему:
+#    docker-compose up -d --build
+#
+# 5. Проверить статус:
+#    docker-compose ps
+#    docker-compose logs -f app  # Логи приложения
+#    docker-compose logs -f db   # Логи базы
+#
+# 6. Применить миграции (если не автоматически):
+#    docker-compose exec app python apply_migrations.py
+#
+# 7. Запустить backfill (первичная загрузка данных):
+#    docker-compose exec app python candle_materializer.py
+#
+# 8. Мониторинг RAM:
+#    docker stats
+#    # Ожидаем: db ~2.5-3GB, app ~1-1.5GB, total <5.5GB
+#
+# 9. Остановка:
+#    docker-compose down  # Остановить, но сохранить данные
+#    docker-compose down -v  # УДАЛИТЬ ВСЁ (включая базу!)
+#
+# ============================================

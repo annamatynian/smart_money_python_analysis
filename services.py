@@ -2,7 +2,9 @@ import asyncio
 from decimal import Decimal
 from domain import LocalOrderBook, TradeEvent, OrderBookUpdate, GapDetectedError
 from infrastructure import IMarketDataSource, ReorderingBuffer, LatencyMonitor
-from analyzers import IcebergAnalyzer, WhaleAnalyzer, AccumulationDetector
+from analyzers import IcebergAnalyzer, WhaleAnalyzer, AccumulationDetector, SpoofingAnalyzer, FlowToxicityAnalyzer, GammaProvider
+from analyzers_features import FeatureCollector  # WHY: Для ML feature collection
+from analyzers_derivatives import DerivativesAnalyzer  # WHY: Clean Architecture - математика derivatives
 from datetime import datetime
 # WHY: Импорт функции загрузки config для мульти-токен поддержки
 from config import get_config
@@ -36,10 +38,36 @@ class TradingEngine:
         config = get_config(symbol)
         self.iceberg_analyzer = IcebergAnalyzer(config)
         self.whale_analyzer = WhaleAnalyzer(config)
+        self.spoofing_analyzer = SpoofingAnalyzer()  # WHY: Anti-spoofing для фильтрации fake walls
+        
+        # === НОВОЕ: FlowToxicityAnalyzer для VPIN (Task: VPIN Implementation) ===
+        # WHY: Рассчитывает токсичность потока для корректировки confidence айсбергов
+        bucket_size = config.vpin_bucket_size  # Из AssetConfig (10 BTC, 100 ETH и т.д.)
+        self.flow_toxicity_analyzer = FlowToxicityAnalyzer(self.book, bucket_size)
         
         # === НОВОЕ: AccumulationDetector для свинг-трейдинга (Phase 3.2) ===
         # WHY: Автоматическая детекция накопления/дистрибуции на мульти-таймфреймах
-        self.accumulation_detector = AccumulationDetector(self.book)
+        # FIX: Gemini Validation - передаём config для мульти-ассет поддержки
+        self.accumulation_detector = AccumulationDetector(self.book, config)
+        
+        # === НОВОЕ: DerivativesAnalyzer для Clean Architecture (Refactor 2025-12-25) ===
+        # WHY: Разделение IO (infrastructure) и математики (analyzer)
+        self.derivatives_analyzer = DerivativesAnalyzer()
+        
+        # === НОВОЕ: GammaProvider для GEX метрик (Fix: Lobotomy Issue) ===
+        # WHY: Читает gamma_profile из LocalOrderBook для FeatureCollector
+        self.gamma_provider = GammaProvider(self.book)
+        
+        # === НОВОЕ: FeatureCollector для ML (Шаг 5: Интеграция) ===
+        # WHY: Собирает снимки всех метрик при обнаружении айсбергов
+        self.feature_collector = FeatureCollector(
+            order_book=self.book,
+            flow_analyzer=None,  # Не используем - данные читаются напрямую из book
+            derivatives_analyzer=self.derivatives_analyzer,  # FIX: Clean Architecture - передаём analyzer!
+            spoofing_detector=self.spoofing_analyzer,  # WHY: Anti-spoofing для ML features
+            gamma_provider=self.gamma_provider,  # FIX: Lobotomy Issue - GEX метрики!
+            flow_toxicity_analyzer=self.flow_toxicity_analyzer  # WHY: VPIN для ML features
+        )
         
         # Очереди для событий (Producer-Consumer pattern)
         self.depth_queue = asyncio.Queue()
@@ -60,6 +88,10 @@ class TradingEngine:
         
         # === FUSION LOGIC: Price tracking for Absorption detection ===
         self._last_mid_price = None  # Используется для расчёта price_change
+        
+        # === FIX: Time-based accumulation check (Gemini Validation) ===
+        # WHY: Iteration-based проверка нестабильна из-за Adaptive Delay
+        self.last_accumulation_check_time = 0.0  # Timestamp последней проверки
 
     async def run(self):
         """
@@ -87,6 +119,10 @@ class TradingEngine:
         # --- НОВАЯ ЗАДАЧА: GEX MONITOR ---
         if self.deribit:
             tasks_to_gather.append(asyncio.create_task(self._produce_gex()))
+            
+            # --- НОВАЯ ЗАДАЧА: DERIVATIVES CACHE (ШАГ 6.3) ---
+            # WHY: Обновляет basis/skew каждые 5 минут для FeatureCollector
+            tasks_to_gather.append(asyncio.create_task(self._feed_derivatives_cache()))
         
         # --- НОВАЯ ЗАДАЧА: PERIODIC CLEANUP (Memory Management) ---
         # WHY: Удаляет старые айсберги каждые 5 минут (вместо счётчика сделок)
@@ -126,11 +162,50 @@ class TradingEngine:
 
     async def _initialize_book(self):
         """
-        Метод-заглушка.
-        Оставлен здесь для предотвращения ошибки, т.к. вся логика инициализации
-        размещена прямо в run() после этого вызова.
+        WHY: Восстанавливает исторический контекст (ЗАДАЧА 3 - Cold Start).
+        
+        Загружает последние 7 дней SmartCandles из БД:
+        - 1H: 168 свечей (7 дней * 24ч)
+        - 4H: 42 свечи (7 дней * 6 свечей/день)
+        - 1D: 30 свечей
+        - 1W: 12 свечей
+        
+        Теория: Детекция накопления требует истории CVD.
         """
-        pass
+        if not self.repository:
+            print("⚠️  No repository - skipping historical context restore")
+            return
+        
+        print("📚 Restoring historical context (7 days)...")
+        
+        # Загружаем для каждого таймфрейма
+        timeframes = {
+            '1h': 168,  # 7 дней
+            '4h': 42,   # 7 дней
+            '1d': 30,   # 30 дней
+            '1w': 12    # 12 недель
+        }
+        
+        for tf, limit in timeframes.items():
+            try:
+                # Вызываем repository.get_aggregated_smart_candles()
+                candles = await self.repository.get_aggregated_smart_candles(
+                    symbol=self.symbol,
+                    timeframe=tf,
+                    limit=limit
+                )
+                
+                # Загружаем в HistoricalMemory
+                self.book.historical_memory.load_from_aggregated_candles(candles, tf)
+                
+                print(f"   ✅ Loaded {len(candles)} {tf} candles")
+                
+            except Exception as e:
+                print(f"   ⚠️  Failed to load {tf} candles: {e}")
+        
+        # Показываем статистику
+        stats = self.book.historical_memory.get_stats()
+        print(f"📊 Historical memory stats: {stats}")
 
     async def _apply_buffered_updates(self):
         """
@@ -187,6 +262,12 @@ class TradingEngine:
         
         iteration_count = 0  # Для периодического обновления delay
         
+        # === FIX: Time-based accumulation check (Gemini Validation) ===
+        # WHY: Инициализируем таймер (если еще не инициализирован)
+        import time
+        if self.last_accumulation_check_time == 0.0:
+            self.last_accumulation_check_time = time.time()
+        
         while True:
             # === НОВОЕ: Adaptive Delay ===
             # WHY: Динамически обновляем задержку каждые 100 итераций
@@ -201,6 +282,25 @@ class TradingEngine:
                     print(f"📊 Latency Stats: RTT={stats['mean_rtt']:.1f}ms, "
                           f"Jitter={stats['stdev_jitter']:.1f}ms, "
                           f"Adaptive Delay={stats['adaptive_delay']:.1f}ms")
+            
+            # === FIX: Accumulation Detection (Wyckoff) - TIME-BASED ===
+            # WHY: Проверяем каждые 30 секунд (вместо 500 итераций)
+            # НЕ привязано к сделкам - работает даже в периоды низкой активности
+            # Gemini Fix: Time-based вместо iteration-based (стабильный интервал)
+            current_time = time.time()
+            if current_time - self.last_accumulation_check_time > 30.0:
+                self.last_accumulation_check_time = current_time  # Reset timer
+                
+                try:
+                    accumulation_results = self.accumulation_detector.detect_accumulation_multi_timeframe()
+                    
+                    # Если обнаружена дивергенция на любом таймфрейме
+                    if accumulation_results:
+                        for timeframe, result in accumulation_results.items():
+                            self._print_accumulation_alert(timeframe, result)
+                except Exception as e:
+                    # Не ломаем главный цикл при ошибках в детекции
+                    print(f"⚠️ Accumulation detection error: {e}")
             
             # 1. Ждем с адаптивной задержкой (Micro-Batching)
             current_delay_sec = self.buffer.delay_sec
@@ -255,21 +355,108 @@ class TradingEngine:
                                 
                                 if current_vol >= pending['visible_before']:
                                     
+                                    # === GEMINI FIX: Извлекаем VPIN и CVD Divergence (Data Fusion) ===
+                                    stored_vpin = pending.get('vpin_score')
+                                    stored_divergence = pending.get('cvd_divergence')
+                                    
                                     iceberg_event = self.iceberg_analyzer.analyze_with_timing(
                                         book=self.book,
                                         trade=trade,
                                         visible_before=pending['visible_before'],
                                         delta_t_ms=delta_t,
-                                        update_time_ms=update_time_ms
+                                        update_time_ms=update_time_ms,
+                                        vpin_score=stored_vpin,        # ✅ GEMINI: Pass VPIN
+                                        cvd_divergence=stored_divergence # ✅ GEMINI: Pass CVD
                                     )
                                     
                                     if iceberg_event:
                                         lvl = self.book.active_icebergs.get(trade.price)
                                         total_hidden = lvl.total_hidden_volume if lvl else iceberg_event.detected_hidden_volume
                                         obi = self.book.get_weighted_obi(depth=20)
+                                        
+                                        # === НОВОЕ: Anti-Spoofing Integration ===
+                                        # WHY: Рассчитываем вероятность спуфинга для корректировки confidence
+                                        if lvl:
+                                            # Получаем текущую mid_price и историю
+                                            current_mid = self.book.get_mid_price()
+                                            price_history = list(self.book.historical_memory.history['1h']['price'])
+                                            
+                                            # Рассчитываем spoofing probability
+                                            spoofing_prob = self.spoofing_analyzer.calculate_spoofing_probability(
+                                                iceberg_level=lvl,
+                                                current_mid_price=current_mid,
+                                                price_history=price_history
+                                            )
+                                            
+                                            # Сохраняем в IcebergLevel
+                                            lvl.spoofing_probability = spoofing_prob
+                                            
+                                            # Корректируем confidence на основе spoofing
+                                            # WHY: Формула adjusted = base * (1 - spoofing_prob)
+                                            base_confidence = lvl.confidence_score
+                                            lvl.confidence_score = base_confidence * (1.0 - spoofing_prob)
+                                        
                                         self._print_iceberg_update(iceberg_event, total_hidden, obi, lvl)
                                         
+                                        # === НОВОЕ: Anti-Spoofing Integration ===
+                                        # WHY: Рассчитываем вероятность спуфинга и корректируем confidence
+                                        if lvl:
+                                            current_mid = self.book.get_mid_price()
+                                            price_history = self.book.historical_memory.get_price_history(limit=100)
+                                            
+                                            spoofing_prob = self.spoofing_analyzer.calculate_spoofing_probability(
+                                                iceberg_level=lvl,
+                                                current_mid_price=current_mid,
+                                                price_history=price_history
+                                            )
+                                            
+                                            # Обновляем поле в айсберге
+                                            lvl.spoofing_probability = spoofing_prob
+                                            
+                                            # Корректируем confidence: adjusted = base * (1 - spoofing_prob)
+                                            if spoofing_prob > 0.5:  # Только если вероятность спуфинга высокая
+                                                original_conf = lvl.confidence_score
+                                                lvl.confidence_score = original_conf * (1.0 - spoofing_prob)
+                                                
+                                                # Debug вывод для высокого spoofing
+                                                if spoofing_prob > 0.7:
+                                                    print(f"   ⚠️  SPOOFING ALERT: {spoofing_prob*100:.0f}% probability (confidence adjusted {original_conf:.2f} → {lvl.confidence_score:.2f})")
+                                        
+                                        # === НОВОЕ: ML Feature Collection (ШАГ 5.2) ===
+                                        # WHY: Сохраняем снимок метрик при обнаружении айсберга
                                         if self.repository and lvl:
+                                            # 1. Собираем snapshot метрик
+                                            snapshot = await self.feature_collector.capture_snapshot()
+                                            
+                                            # 2. Классифицируем намерение (SCALPER/INTRADAY/POSITIONAL)
+                                            # TODO: Replace estimated_adv with actual ADV from historical_memory
+                                            # WHY: Используем fallback оценку пока нет точных данных
+                                            estimated_adv = Decimal("10000")  # ~10k BTC average for BTCUSDT
+                                            intention_type = self.iceberg_analyzer.classify_intention(
+                                                hidden_volume=lvl.total_hidden_volume,
+                                                adv_20d=estimated_adv
+                                            )
+                                            
+                                            # 3. Вычисляем IIR (Iceberg Impact Ratio)
+                                            iir_value = float(lvl.total_hidden_volume / estimated_adv) if estimated_adv > 0 else 0.0
+                                            
+                                            # 4. Создаем lifecycle event с классификацией
+                                            lifecycle_id = await self.repository.save_lifecycle_event(
+                                                symbol=self.symbol,
+                                                price=trade.price,
+                                                is_ask=lvl.is_ask,
+                                                event_type='REFILLED',  # Или 'DETECTED' для первого обнаружения
+                                                total_volume_absorbed=lvl.total_hidden_volume,
+                                                refill_count=lvl.refill_count,
+                                                intention_type=intention_type,  # NEW: Smart Money classification
+                                                iir_value=iir_value              # NEW: Impact ratio
+                                            )
+                                            
+                                            # 3. Сохраняем feature snapshot
+                                            if lifecycle_id:
+                                                await self.repository.save_feature_snapshot(lifecycle_id, snapshot)
+                                            
+                                            # 4. Сохраняем уровень (старая логика)
                                             asyncio.create_task(self.repository.save_level(lvl, self.symbol))
                                     
                                     self.book.pending_refill_checks.remove(pending)
@@ -287,6 +474,14 @@ class TradingEngine:
                 elif isinstance(event, TradeEvent):
                     trade = event
                     
+                    # === НОВОЕ: VPIN Update (Обновление токсичности потока) ===
+                    # WHY: Рассчитываем VPIN при каждой сделке
+                    vpin_score = self.flow_toxicity_analyzer.update_vpin(trade)
+                    
+                    # === GEMINI FIX: Захват CVD Divergence (Data Fusion) ===
+                    # WHY: Получаем cached divergence для передачи в analyze_with_timing()
+                    current_divergence = self.accumulation_detector.get_current_divergence_state()
+                    
                     # === ЛОГИКА АНАЛИЗА (ИЗ ТВОЕЙ СТАРОЙ ВЕРСИИ) ===
 
                     # 1. Пробой уровней (Check Breaches)
@@ -299,6 +494,18 @@ class TradingEngine:
                     # Возвращает 3 значения: категория, объем в $, и флаг алгоритма
                     # WHY: Используем экземпляр анализатора с config (адаптирован под токен)
                     category, vol_usd, algo_alert = self.whale_analyzer.update_stats(self.book, trade)
+                    
+                    # === FIX: Обновляем историческую память для аккумуляции (Task: Full Wyckoff) ===
+                    # WHY: Сохраняем Whale/Minnow CVD и цену для детекции дивергенции
+                    current_ts = datetime.fromtimestamp(trade.event_time / 1000.0)
+                    
+                    self.book.historical_memory.update_history(
+                        timestamp=current_ts,
+                        whale_cvd=self.book.whale_cvd['whale'],   # Данные уже обновлены в update_stats
+                        minnow_cvd=self.book.whale_cvd['minnow'], # Данные уже обновлены в update_stats
+                        price=trade.price
+                    )
+                    # ========================================================
                     
                     # Если обнаружен алгоритмический бот
                     if algo_alert:
@@ -329,12 +536,15 @@ class TradingEngine:
                         target_vol = self.book.asks.get(trade.price, Decimal("0"))
     
                     # 2. DO NOT analyze immediately - add to pending queue
+                    # === GEMINI FIX: Сохраняем VPIN и CVD Divergence (Data Fusion) ===
                     self.book.pending_refill_checks.append({
                         'trade': trade,
                         'visible_before': target_vol,
                         'trade_time_ms': trade.event_time,
                         'price': trade.price,
-                        'is_ask': not trade.is_buyer_maker
+                        'is_ask': not trade.is_buyer_maker,
+                        'vpin_score': vpin_score,           # ✅ GEMINI: VPIN context
+                        'cvd_divergence': current_divergence # ✅ GEMINI: CVD context
                     })
     
                     # 3. Cleanup old entries (> 100ms ago)
@@ -362,6 +572,10 @@ class TradingEngine:
                     
                     # Сохраняем текущую цену для следующей итерации
                     self._last_mid_price = current_mid
+                    
+                    # === НОВОЕ: Update FeatureCollector price history (ШАГ 5.3) ===
+                    # WHY: Обновляем историю цен для расчета TWAP/volatility
+                    self.feature_collector.update_price(float(current_mid))
                     
                     # === ML LOGIC ===
                     # Определяем, сохранять ли данные (Крупная сделка > 0.1 BTC ИЛИ есть активный айсберг)
@@ -422,21 +636,40 @@ class TradingEngine:
                             import traceback
                             traceback.print_exc()
                     
-                    # === MARKET METRICS LOGGING (Gemini Phase 3.2) ===
-                    # WHY: Логируем метрики OFI/OBI для ML-моделей (каждые 10 сделок)
+                    # === GEMINI FIX: MARKET METRICS LOGGING (Migration 005) ===
+                    # WHY: Логируем метрики с правильными именами + wall volumes
                     if self.repository and (self.book.trade_count % 10 == 0):
                         try:
-                            await self.repository.log_market_metrics(
-                                symbol=self.symbol,
-                                timestamp=datetime.now(),
-                                mid_price=current_mid,
-                                ofi=ofi_value,
-                                obi=curr_obi if 'curr_obi' in locals() else self.book.get_weighted_obi(use_exponential=True),
-                                spread_bps=self.book.get_spread()
-                            )
-                            # Note: absorption_detected не логируется отдельно (можно добавить колонку в БД позже)
+                            # 1. Агрегируем wall volumes из активных айсбергов
+                            wall_whale_vol = Decimal('0')
+                            wall_dolphin_vol = Decimal('0')
+                            
+                            for iceberg in self.book.active_icebergs.values():
+                                if iceberg.status.value == 'ACTIVE':  # Только активные
+                                    if iceberg.is_dolphin:
+                                        wall_dolphin_vol += iceberg.total_hidden_volume
+                                    else:
+                                        wall_whale_vol += iceberg.total_hidden_volume
+                            
+                            # 2. Логируем с новыми именами колонок
+                            await self.repository.log_full_metric({
+                                'timestamp': datetime.now(),
+                                'symbol': self.symbol,
+                                'price': current_mid,
+                                'spread_bps': self.book.get_spread(),
+                                'book_ofi': ofi_value,  # ✅ NEW NAME
+                                'book_obi': curr_obi if 'curr_obi' in locals() else self.book.get_weighted_obi(depth=20),  # ✅ NEW NAME
+                                'flow_whale_cvd_delta': self.book.whale_cvd.get('whale', 0),  # ✅ NEW NAME
+                                'flow_dolphin_cvd_delta': self.book.whale_cvd.get('dolphin', 0),  # ✅ NEW COLUMN
+                                'flow_minnow_cvd_delta': self.book.whale_cvd.get('minnow', 0),  # ✅ NEW NAME
+                                'wall_whale_vol': float(wall_whale_vol),  # ✅ NEW COLUMN
+                                'wall_dolphin_vol': float(wall_dolphin_vol),  # ✅ NEW COLUMN
+                                'basis': None,  # TODO: подключить derivatives
+                                'skew': None,   # TODO: подключить derivatives
+                                'oi_delta': None
+                            })
                         except Exception as e:
-                            print(f"❌ [ERROR] log_market_metrics failed: {e}")
+                            print(f"❌ [ERROR] log_full_metric failed: {e}")
                     
                     # === КОНЕЦ ML LOGIC ==="
                   
@@ -586,6 +819,54 @@ class TradingEngine:
             print(f"   ⚠️  {gamma_msg}")
         print("=" * 50)
     
+    def _print_accumulation_alert(self, timeframe: str, result: dict):
+        """
+        WHY: Алерт о накоплении/дистрибуции (Wyckoff)
+        
+        Параметры:
+        - SPRING: 🌱 (Bullish, идеальный сигнал)
+        - UPTHRUST: 💥 (Bearish, ложный пробой)
+        - ACCUMULATION: 👂 (Bullish, базовый)
+        - DISTRIBUTION: 🐻 (Bearish, базовый)
+        
+        Args:
+            timeframe: '1h', '4h', '1d', '1w'
+            result: dict с результатами detect_accumulation()
+        """
+        # Определяем цвет и иконку по типу
+        div_type = result['type']
+        pattern = result['wyckoff_pattern']
+        confidence = result['confidence']
+        
+        # Цвета и иконки
+        if div_type == 'BULLISH':
+            color = Colors.GREEN
+            icon = "👂" if pattern == 'ACCUMULATION' else "🌱"
+            type_label = "BULLISH ACCUMULATION"
+        else:
+            color = Colors.RED
+            icon = "🐻" if pattern == 'DISTRIBUTION' else "💥"
+            type_label = "BEARISH DISTRIBUTION"
+        
+        # Паттерн badge
+        pattern_badge = f"{Colors.YELLOW}[{pattern}]{Colors.RESET}" if pattern in ['SPRING', 'UPTHRUST'] else f"[{pattern}]"
+        
+        print(f"\n{icon} {color}{type_label}{Colors.RESET} {pattern_badge} | Timeframe: {timeframe.upper()}")
+        print(f"   🎯 Confidence: {confidence*100:.0f}%")
+        
+        # Дополнительные индикаторы
+        if result.get('absorption_detected'):
+            print(f"   💧 Passive Absorption: CONFIRMED")
+        
+        if result.get('obi_confirms'):
+            print(f"   ⚖️  OBI Confirmation: CONFIRMED")
+        
+        if result.get('near_strong_zone'):
+            zone_price = result.get('zone_price')
+            print(f"   🎯 Near Strong Zone: ${zone_price:,.2f}")
+        
+        print("-" * 50)
+    
     # WHY: Вспомогательные методы для Delta-t реализации
     
     def _cleanup_pending_checks(self, current_time_ms: int):
@@ -666,3 +947,131 @@ class TradingEngine:
                 print(f"❌ Cleanup task error: {e}")
                 # Continue running despite errors
                 continue
+    
+    # === НОВОЕ: Derivatives Cache Background Task (ШАГ 6.4) ===
+    
+    async def _feed_derivatives_cache(self, interval_seconds: int = 300):
+        """
+        WHY: Фоновая задача обновления derivatives метрик.
+        
+        Clean Architecture (REFACTORED 2025-12-25):
+        1. Infrastructure (self.deribit) - ТОЛЬКО IO: get_futures_data(), get_options_data()
+        2. Analyzer (self.derivatives_analyzer) - ТОЛЬКО математика: calculate_annualized_basis(), calculate_options_skew()
+        3. Services (этот метод) - Оркестрация: fetch → analyze → cache
+        
+        Обновляет кеш в FeatureCollector для использования при capture_snapshot().
+        
+        Теория (документ "Анализ умных денег"):
+        - Basis > 20%: Перегрев, смарт-мани открывают Cash-and-Carry арбитраж
+        - Skew > 10%: Экстремальный страх, противоположный сигнал
+        
+        Args:
+            interval_seconds: Интервал обновления (default 300с = 5 мин)
+        """
+        print(f"📡 Derivatives Cache Monitor started (interval: {interval_seconds}s)")
+        
+        # WHY: Определяем currency из symbol (BTCUSDT → BTC)
+        currency = self.symbol.replace('USDT', '')
+        
+        while True:
+            try:
+                # Wait for interval
+                await asyncio.sleep(interval_seconds)
+                
+                # === 1. Infrastructure: Запрашиваем RAW данные (IO only) ===
+                futures_data = await self.deribit.get_futures_data(currency=currency)
+                options_data = await self.deribit.get_options_data(currency=currency)
+                
+                # === 2. Analyzer: Рассчитываем метрики (pure math) ===
+                basis_apr = None
+                if futures_data:
+                    basis_apr = self.derivatives_analyzer.calculate_annualized_basis(
+                        spot_price=futures_data['spot_price'],
+                        futures_price=futures_data['futures_price'],
+                        days_to_expiry=futures_data['days_to_expiry']
+                    )
+                
+                skew = None
+                if options_data:
+                    skew = self.derivatives_analyzer.calculate_options_skew(
+                        put_iv_25d=options_data['put_iv_25d'],
+                        call_iv_25d=options_data['call_iv_25d']
+                    )
+                
+                # === 3. Services: Обновляем кеш в FeatureCollector (orchestration) ===
+                if basis_apr is not None:
+                    self.feature_collector.cached_basis = basis_apr
+                
+                if skew is not None:
+                    self.feature_collector.cached_skew = skew
+                
+                # Лог обновления (раз в 5 минут)
+                if basis_apr is not None or skew is not None:
+                    print(f"📡 Derivatives Cache: Basis={basis_apr:.2f}% | Skew={skew:.2f}%" if basis_apr and skew else f"📡 Derivatives Cache: Basis={basis_apr}% | Skew={skew}%")
+                
+            except asyncio.CancelledError:
+                print("📡 Derivatives cache task cancelled")
+                break
+            except Exception as e:
+                print(f"❌ Derivatives cache error: {e}")
+                # Continue running despite errors
+                continue
+    
+    async def _produce_gex(self):
+        """
+        WHY: Фоновый монитор Gamma Exposure (Clean Architecture).
+        
+        Orchestration:
+        1. Infrastructure (IO): Запрос сырых данных опционов (get_gamma_data)
+        2. Analyzer (Math): Расчет GEX по модели Блэка-Шоулза (calculate_gex)
+        3. Domain (State): Обновление self.book.gamma_profile
+        """
+        print("🌊 Deribit GEX Monitor started...")
+        
+        # Определяем базовый актив (BTCUSDT -> BTC)
+        # Если symbol сложный, нужна проверка, но пока assuming standard naming
+        currency = self.symbol.replace('USDT', '')
+        
+        # WHY: First iteration delay = 0 (запускаем сразу), потом 60с
+        delay = 0
+        
+        while True:
+            try:
+                # WHY: Sleep BEFORE get_gamma_data для правильного тестирования
+                # Первый вызов: delay=0 (немедленно)
+                # Последующие: delay=60 (каждые 60 секунд)
+                await asyncio.sleep(delay)
+                delay = 60  # Set delay for next iterations
+                
+                # === 1. IO: Получаем сырые данные (без блокировок) ===
+                # Возвращает dict: keys=['strikes', 'ivs', 'expiry_years', ...]
+                # Используем метод из infrastructure.py (DeribitInfrastructure)
+                raw_data = await self.deribit.get_gamma_data(currency=currency)
+                
+                if raw_data:
+                    # === 2. MATH: Считаем GEX через Analyzer ===
+                    # Analyzer чистая функция, не делает запросов.
+                    # Метод calculate_gex находится в analyzers_derivatives.py
+                    profile = self.derivatives_analyzer.calculate_gex(
+                        strikes=raw_data['strikes'],
+                        types=raw_data['types'],
+                        expiry_years=raw_data['expiry_years'],
+                        ivs=raw_data['ivs'],
+                        open_interest=raw_data['open_interest'],
+                        underlying_price=raw_data['underlying_price']
+                    )
+                    
+                    if profile:
+                        # === 3. STATE: Обновляем состояние книги ===
+                        # Это позволяет IcebergAnalyzer видеть стены в реальном времени
+                        self.book.gamma_profile = profile
+                        
+                        # Опционально: Логируем обновление (можно закомментировать, чтобы не спамить)
+                        # print(f"🌊 GEX Updated: ${profile.total_gex/1e6:.1f}M "
+                        #       f"| Call Wall: {profile.call_wall} | Put Wall: {profile.put_wall}")
+                else:
+                    # Если данных нет (например, Rate Limit или ошибка сети)
+                    pass
+
+            except Exception as e:
+                print(f"❌ GEX Monitor Error: {e}")

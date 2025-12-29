@@ -39,16 +39,17 @@ def test_detect_bullish_divergence_1h():
     # Симулируем данные с накоплением
     base_time = datetime.now() - timedelta(hours=5)
     scenarios = [
-        (0, Decimal("95000"), 1000.0),  # Старт
-        (1, Decimal("94500"), 1200.0),  # Цена ↓, CVD ↑
-        (2, Decimal("94000"), 1500.0),  # Цена ↓, CVD ↑
-        (3, Decimal("94200"), 1800.0),  # Отскок, CVD ↑
-        (4, Decimal("93800"), 2000.0),  # Lower Low price, Higher Low CVD!
+        # (hours, price, whale_cvd, minnow_cvd)
+        (0, Decimal("95000"), 1000.0, 500.0),   # Старт
+        (1, Decimal("94500"), 1200.0, 400.0),   # Цена ↓, Whale ↑, Minnow ↓
+        (2, Decimal("94000"), 1500.0, 300.0),   # Цена ↓, Whale ↑, Minnow ↓
+        (3, Decimal("94200"), 1800.0, 250.0),   # Отскок, Whale ↑, Minnow ↓
+        (4, Decimal("93800"), 2000.0, 200.0),   # Lower Low + Higher Whale + Lower Minnow!
     ]
     
-    for hours, price, whale_cvd in scenarios:
+    for hours, price, whale_cvd, minnow_cvd in scenarios:
         timestamp = base_time + timedelta(hours=hours)
-        book.historical_memory.update_history(timestamp, whale_cvd, price)
+        book.historical_memory.update_history(timestamp, whale_cvd, minnow_cvd, price)
     
     # Детектируем
     result = detector.detect_accumulation(timeframe='1h')
@@ -64,6 +65,14 @@ def test_detect_bullish_divergence_1h():
     
     assert result['confidence'] >= 0.5, \
         f"FAIL: Confidence должна быть >=0.5, получили {result['confidence']}"
+    
+    # === НОВЫЕ ПОЛЯ: Wyckoff Pattern ===
+    assert 'wyckoff_pattern' in result, "FAIL: Должно быть поле wyckoff_pattern"
+    assert result['wyckoff_pattern'] in ['SPRING', 'ACCUMULATION'], \
+        f"FAIL: Паттерн должен быть SPRING или ACCUMULATION, получили {result['wyckoff_pattern']}"
+    
+    assert 'absorption_detected' in result, "FAIL: Должно быть поле absorption_detected"
+    assert 'obi_confirms' in result, "FAIL: Должно быть поле obi_confirms"
 
 
 def test_detect_bearish_divergence_4h():
@@ -81,16 +90,17 @@ def test_detect_bearish_divergence_4h():
     # Симулируем данные с дистрибуцией
     base_time = datetime.now() - timedelta(hours=20)
     scenarios = [
-        (0, Decimal("95000"), 2000.0),   # Старт
-        (4, Decimal("95500"), 1800.0),   # Цена ↑, CVD ↓
-        (8, Decimal("96000"), 1500.0),   # Цена ↑, CVD ↓
-        (12, Decimal("95800"), 1300.0),  # Откат, CVD ↓
-        (16, Decimal("96200"), 1000.0),  # Higher High price, Lower High CVD!
+        # (hours, price, whale_cvd, minnow_cvd)
+        (0, Decimal("95000"), 2000.0, 200.0),    # Старт
+        (4, Decimal("95500"), 1800.0, 300.0),    # Цена ↑, Whale ↓, Minnow ↑
+        (8, Decimal("96000"), 1500.0, 400.0),    # Цена ↑, Whale ↓, Minnow ↑
+        (12, Decimal("95800"), 1300.0, 450.0),   # Откат, Whale ↓, Minnow ↑
+        (16, Decimal("96200"), 1000.0, 500.0),   # Higher High + Lower Whale + Higher Minnow!
     ]
     
-    for hours, price, whale_cvd in scenarios:
+    for hours, price, whale_cvd, minnow_cvd in scenarios:
         timestamp = base_time + timedelta(hours=hours)
-        book.historical_memory.update_history(timestamp, whale_cvd, price)
+        book.historical_memory.update_history(timestamp, whale_cvd, minnow_cvd, price)
     
     result = detector.detect_accumulation(timeframe='4h')
     
@@ -100,6 +110,10 @@ def test_detect_bearish_divergence_4h():
         f"FAIL: Должна быть BEARISH дивергенция, получили {result['type']}"
     
     assert result['timeframe'] == '4h'
+    
+    # === НОВЫЕ ПОЛЯ ===
+    assert result['wyckoff_pattern'] in ['UPTHRUST', 'DISTRIBUTION'], \
+        f"FAIL: Паттерн должен быть UPTHRUST или DISTRIBUTION, получили {result['wyckoff_pattern']}"
 
 
 def test_no_divergence_when_aligned():
@@ -116,14 +130,15 @@ def test_no_divergence_when_aligned():
     
     base_time = datetime.now() - timedelta(hours=3)
     scenarios = [
-        (0, Decimal("95000"), 1000.0),
-        (1, Decimal("95500"), 1500.0),
-        (2, Decimal("96000"), 2000.0),
+        # WHY: Both price and CVD rising (no divergence)
+        (0, Decimal("95000"), 1000.0, 500.0),
+        (1, Decimal("95500"), 1500.0, 600.0),
+        (2, Decimal("96000"), 2000.0, 700.0),
     ]
     
-    for hours, price, whale_cvd in scenarios:
+    for hours, price, whale_cvd, minnow_cvd in scenarios:
         timestamp = base_time + timedelta(hours=hours)
-        book.historical_memory.update_history(timestamp, whale_cvd, price)
+        book.historical_memory.update_history(timestamp, whale_cvd, minnow_cvd, price)
     
     result = detector.detect_accumulation(timeframe='1h')
     
@@ -154,14 +169,14 @@ def test_correlation_with_iceberg_zones():
     # 1. Создаём BULLISH дивергенцию
     base_time = datetime.now() - timedelta(hours=5)
     scenarios = [
-        (0, Decimal("95000"), 1000.0),
-        (2, Decimal("94500"), 1500.0),
-        (4, Decimal("94000"), 2000.0),  # Lower Low price, Higher Low CVD
+        (0, Decimal("95000"), 1000.0, 500.0),
+        (2, Decimal("94500"), 1500.0, 400.0),
+        (4, Decimal("94000"), 2000.0, 300.0),  # Lower Low price, Higher Whale, Lower Minnow
     ]
     
-    for hours, price, whale_cvd in scenarios:
+    for hours, price, whale_cvd, minnow_cvd in scenarios:
         timestamp = base_time + timedelta(hours=hours)
-        book.historical_memory.update_history(timestamp, whale_cvd, price)
+        book.historical_memory.update_history(timestamp, whale_cvd, minnow_cvd, price)
     
     # 2. Создаём сильную BID зону ОКОЛО текущей цены (93800)
     # WHY: Зона должна быть близко к финальной цене (93800)
@@ -186,6 +201,11 @@ def test_correlation_with_iceberg_zones():
     
     assert result['confidence'] >= 0.7, \
         f"FAIL: Confidence с зоной должна быть >=0.7, получили {result['confidence']}"
+    
+    # === ПРОВЕРКА: Если рядом сильная зона → высокий шанс SPRING ===
+    # WHY: Зона + Absorption + OBI → может быть SPRING
+    assert result['wyckoff_pattern'] in ['SPRING', 'ACCUMULATION'], \
+        f"FAIL: Паттерн должен быть SPRING или ACCUMULATION, получили {result['wyckoff_pattern']}"
 
 
 def test_multi_timeframe_analysis():
@@ -206,10 +226,12 @@ def test_multi_timeframe_analysis():
         timestamp = base_time + timedelta(hours=i)
         # Цена падает
         price = Decimal("95000") - Decimal(i * 50)
-        # CVD растет
+        # Whale CVD растет
         whale_cvd = 1000.0 + i * 100
+        # Minnow CVD падает (паника)
+        minnow_cvd = 500.0 - i * 10
         
-        book.historical_memory.update_history(timestamp, whale_cvd, price)
+        book.historical_memory.update_history(timestamp, whale_cvd, minnow_cvd, price)
     
     # Анализируем все таймфреймы
     results = detector.detect_accumulation_multi_timeframe()
@@ -237,10 +259,11 @@ def test_insufficient_data():
     
     # Добавляем только 2 точки (недостаточно)
     base_time = datetime.now()
-    book.historical_memory.update_history(base_time, 1000.0, Decimal("95000"))
+    book.historical_memory.update_history(base_time, 1000.0, 500.0, Decimal("95000"))
     book.historical_memory.update_history(
         base_time + timedelta(hours=1), 
-        1200.0, 
+        1200.0,
+        450.0,
         Decimal("94000")
     )
     

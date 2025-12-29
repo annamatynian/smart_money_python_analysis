@@ -355,7 +355,26 @@ class DeribitInfrastructure:
     """
     BASE_URL = "https://www.deribit.com/api/v2/public"
 
-    async def get_gamma_profile(self, currency="BTC") -> Optional[GammaProfile]:
+    async def get_gamma_data(self, currency="BTC") -> Optional[Dict[str, Any]]:
+        """
+        WHY: Загружает RAW данные опционов (IO только, математика в Analyzer).
+        
+        Clean Architecture Pattern:
+        - Infrastructure: Только HTTP запросы + подготовка данных
+        - Analyzer: Математика (Black-Scholes, агрегация GEX)
+        - Services: Оркестрация (fetch → analyze → cache)
+        
+        Returns:
+            {
+                'strikes': List[float],
+                'types': List[str],       # 'C' or 'P'
+                'expiry_years': List[float],
+                'ivs': List[float],       # Implied Volatility
+                'open_interest': List[float],
+                'underlying_price': float
+            }
+            None если нет данных
+        """
         url = f"{self.BASE_URL}/get_book_summary_by_currency"
         params = {"currency": currency, "kind": "option"}
         
@@ -375,19 +394,27 @@ class DeribitInfrastructure:
             
             if 'result' not in data: return None
             
-            # Выносим тяжелую математику Pandas в отдельный поток,
+            # Выносим подготовку данных Pandas в отдельный поток,
             # чтобы не блокировать обработку стакана Binance.
             loop = asyncio.get_running_loop()
-            profile = await loop.run_in_executor(None, self._calculate_gex_sync, data['result'])
-            return profile
+            prepared_data = await loop.run_in_executor(None, self._prepare_gamma_data_sync, data['result'])
+            return prepared_data
 
         except Exception as e:
             print(f"❌ Deribit Connection Error: {e}")
             return None
 
-    def _calculate_gex_sync(self, raw_data) -> Optional[GammaProfile]:
+    def _prepare_gamma_data_sync(self, raw_data) -> Optional[Dict[str, Any]]:
         """
-        Полная копия логики из вашего файла deribit_loader.py
+        WHY: Подготовка данных (IO только, математика в Analyzer).
+        
+        Процесс:
+        1. Парсинг инструментов (strike, type, expiry)
+        2. Фильтрация по времени (исключаем истекшие)
+        3. Расчет IV (mark_iv или (bid_iv + ask_iv)/2)
+        4. Возврат RAW данных
+        
+        Математика (Black-Scholes, GEX агрегация) в DerivativesAnalyzer
         """
         try:
             df = pd.DataFrame(raw_data)
@@ -426,27 +453,193 @@ class DeribitInfrastructure:
             # Удаляем те, где IV так и не нашли
             df = df.dropna(subset=['iv'])
 
-            # [CHECK 5] Формула Блэка-Шоулза (как в строках 119-123 оригинала)
-            df['S'] = df['underlying_price']
-            d1 = (np.log(df['S']/df['strike']) + (0.5 * df['iv']**2) * df['years']) / (df['iv'] * np.sqrt(df['years']))
-            df['gamma'] = norm.pdf(d1) / (df['S'] * df['iv'] * np.sqrt(df['years']))
-            
-            # [CHECK 6] Расчет GEX и Инверсия Путов (как в строках 126-129 оригинала)
-            df['gex'] = df['gamma'] * df['open_interest'] * (df['S']**2) * 0.01
-            df.loc[df['type'] == 'P', 'gex'] *= -1 
-            
-            # [CHECK 7] Агрегация Стен (как в блоке print оригинала)
+            # Возвращаем RAW данные для DerivativesAnalyzer
             if df.empty: return None
-
-            total_gex = df['gex'].sum()
-            call_wall = df[df['type']=='C'].groupby('strike')['gex'].sum().idxmax()
-            put_wall = df[df['type']=='P'].groupby('strike')['gex'].sum().idxmin()
             
-            return GammaProfile(
-                total_gex=total_gex, 
-                call_wall=call_wall, 
-                put_wall=put_wall
-            )
+            return {
+                'strikes': df['strike'].tolist(),
+                'types': df['type'].tolist(),
+                'expiry_years': df['years'].tolist(),
+                'ivs': df['iv'].tolist(),
+                'open_interest': df['open_interest'].tolist(),
+                'underlying_price': df['underlying_price'].iloc[0]  # Одинаково для всех
+            }
         except Exception as e:
             # print(f"Math Error in GEX: {e}") # Для отладки
+            return None
+    
+    # === РЕФАКТОРИНГ: Clean Architecture - IO Only (ШАГ 6.1) ===
+    
+    async def get_futures_data(self, currency="BTC") -> Optional[Dict[str, Any]]:
+        """
+        WHY: Загружает RAW данные фьючерсов (IO только, математика в Analyzer).
+        
+        Clean Architecture Pattern:
+        - Infrastructure: Только HTTP запросы
+        - Analyzer: Математика (calculate_annualized_basis)
+        - Services: Оркестрация (fetch → analyze → cache)
+        
+        Returns:
+            {
+                'spot_price': float,
+                'futures_price': float,
+                'days_to_expiry': float
+            }
+            None если нет данных
+        """
+        url = f"{self.BASE_URL}/get_instruments"
+        params = {"currency": currency, "kind": "future", "expired": "false"}
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 429:
+                        return None
+                    if resp.status != 200:
+                        return None
+                    
+                    data = await resp.json()
+            
+            if 'result' not in data or not data['result']:
+                return None
+            
+            # Ищем ближайший квартальный контракт (например, BTC-28JUN25)
+            futures = [f for f in data['result'] if f['settlement_period'] == 'month']
+            
+            if not futures:
+                return None
+            
+            # Берем первый активный контракт (наибольшая ликвидность)
+            future = sorted(futures, key=lambda x: x.get('expiration_timestamp', 0))[0]
+            
+            # Получаем ticker для mark_price
+            ticker_url = f"{self.BASE_URL}/ticker"
+            ticker_params = {"instrument_name": future['instrument_name']}
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(ticker_url, params=ticker_params) as resp:
+                    if resp.status != 200:
+                        return None
+                    ticker_data = await resp.json()
+            
+            if 'result' not in ticker_data:
+                return None
+            
+            result = ticker_data['result']
+            futures_price = result.get('mark_price')  # F
+            spot_price = result.get('underlying_index')  # S
+            expiration_ts = future.get('expiration_timestamp')
+            
+            if not all([futures_price, spot_price, expiration_ts]):
+                return None
+            
+            # Расчет DTE (Days To Expiration)
+            now_ts = pd.Timestamp.now(tz='utc').timestamp() * 1000  # в миллисекундах
+            days_to_expiry = (expiration_ts - now_ts) / (1000 * 60 * 60 * 24)
+            
+            if days_to_expiry <= 0:
+                return None  # Контракт уже истек
+            
+            # Возвращаем RAW данные (математика в DerivativesAnalyzer)
+            return {
+                'spot_price': spot_price,
+                'futures_price': futures_price,
+                'days_to_expiry': days_to_expiry
+            }
+            
+        except Exception as e:
+            # print(f"Basis calculation error: {e}")
+            return None
+    
+    # === РЕФАКТОРИНГ: Clean Architecture - IO Only (ШАГ 6.2) ===
+    
+    async def get_options_data(self, currency="BTC") -> Optional[Dict[str, Any]]:
+        """
+        WHY: Загружает RAW данные опционов (IO только, математика в Analyzer).
+        
+        Clean Architecture Pattern:
+        - Infrastructure: Только HTTP запросы
+        - Analyzer: Математика (calculate_options_skew)
+        - Services: Оркестрация (fetch → analyze → cache)
+        
+        Returns:
+            {
+                'put_iv_25d': float,  # 25-delta OTM Put IV
+                'call_iv_25d': float  # 25-delta OTM Call IV
+            }
+            None если нет данных
+        """
+        url = f"{self.BASE_URL}/get_book_summary_by_currency"
+        params = {"currency": currency, "kind": "option"}
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 429:
+                        return None
+                    if resp.status != 200:
+                        return None
+                    
+                    data = await resp.json()
+            
+            if 'result' not in data or not data['result']:
+                return None
+            
+            # Фильтруем опционы с expiry ~30 дней
+            df = pd.DataFrame(data['result'])
+            
+            # Парсинг инструмента (BTC-31JAN25-100000-C)
+            def parse_instrument(name):
+                try:
+                    parts = name.split('-')
+                    return {
+                        'strike': float(parts[2]),
+                        'type': parts[3],  # 'C' or 'P'
+                        'expiry': pd.to_datetime(parts[1], utc=True, format='mixed')
+                    }
+                except:
+                    return None
+            
+            df['parsed'] = df['instrument_name'].apply(parse_instrument)
+            df = df.dropna(subset=['parsed'])
+            
+            df['strike'] = df['parsed'].apply(lambda x: x['strike'])
+            df['type'] = df['parsed'].apply(lambda x: x['type'])
+            df['expiry'] = df['parsed'].apply(lambda x: x['expiry'])
+            
+            # Фильтр по времени (25-35 дней до expiry)
+            now = pd.Timestamp.now(tz='utc')
+            df['days_to_expiry'] = (df['expiry'] - now).dt.total_seconds() / (60 * 60 * 24)
+            df = df[(df['days_to_expiry'] >= 25) & (df['days_to_expiry'] <= 35)]
+            
+            if df.empty:
+                return None
+            
+            # Ищем 25-delta options (OTM)
+            # Упрощение: берем опционы с strike ~5% OTM
+            spot_price = df['underlying_price'].iloc[0]
+            
+            # Puts: strike < spot (OTM puts)
+            puts = df[(df['type'] == 'P') & (df['strike'] < spot_price * 0.95)]
+            # Calls: strike > spot (OTM calls)
+            calls = df[(df['type'] == 'C') & (df['strike'] > spot_price * 1.05)]
+            
+            if puts.empty or calls.empty:
+                return None
+            
+            # Берем среднюю IV
+            put_iv_avg = puts['mark_iv'].mean()
+            call_iv_avg = calls['mark_iv'].mean()
+            
+            if pd.isna(put_iv_avg) or pd.isna(call_iv_avg):
+                return None
+            
+            # Возвращаем RAW данные (математика в DerivativesAnalyzer)
+            return {
+                'put_iv_25d': put_iv_avg,
+                'call_iv_25d': call_iv_avg
+            }
+            
+        except Exception as e:
+            # print(f"Skew calculation error: {e}")
             return None
