@@ -39,10 +39,24 @@ class MockOrderBook:
             'dolphin': 10000.0,
             'minnow': -5000.0  # WHY: Используется 'minnow', а не 'fish'
         }
+        # FIX (Gemini): Добавляем OFI
+        self._ofi_value = 25.0  # Mock value for testing
     
     def get_weighted_obi(self, depth=20, use_exponential=True):
         """WHY: LocalOrderBook имеет этот метод"""
         return 0.35  # Положительный дисбаланс
+    
+    def calculate_ofi(self):
+        """FIX (Gemini): FeatureCollector._get_ofi() вызывает этот метод"""
+        return self._ofi_value
+    
+    def get_best_bid(self):
+        """WHY: FeatureCollector._get_current_price() использует этот метод"""
+        return (self.best_bid, Decimal('1.0'))  # Returns (price, qty)
+    
+    def get_best_ask(self):
+        """WHY: FeatureCollector._get_current_price() использует этот метод"""
+        return (self.best_ask, Decimal('1.0'))  # Returns (price, qty)
 
 
 class MockDerivativesAnalyzer:
@@ -102,40 +116,47 @@ async def test_feature_collector_with_all_dependencies():
     for i in range(10):
         collector.update_price(60000 + i * 10)
     
-    # Обновляем OFI
-    collector.update_ofi(bid_depth=100, ask_depth=80)
-    collector.update_ofi(bid_depth=120, ask_depth=75)
+    # Act - FIRST call (initializes state, returns 0)
+    snapshot1 = collector.capture_snapshot()
     
-    # Act
-    snapshot = await collector.capture_snapshot()
+    # WHY: Изменяем CVD для второго вызова (симулируем реальную торговлю)
+    book.whale_cvd['whale'] = 60000.0  # +10000 delta
+    book.whale_cvd['dolphin'] = 12000.0  # +2000 delta
+    book.whale_cvd['minnow'] = -6000.0  # -1000 delta
     
-    # Assert
-    assert snapshot is not None
-    assert isinstance(snapshot, FeatureSnapshot)
+    # Act - SECOND call (returns actual delta)
+    snapshot2 = collector.capture_snapshot()
+    
+    # Assert - Use SECOND snapshot (has deltas)
+    assert snapshot2 is not None
+    assert isinstance(snapshot2, FeatureSnapshot)
     
     # Orderbook метрики
-    assert snapshot.spread_bps is not None
-    assert snapshot.spread_bps > 0
-    assert snapshot.depth_ratio is not None
-    assert snapshot.obi_value == 0.35
-    assert snapshot.ofi_value is not None  # OFI должен обновиться
+    assert snapshot2.spread_bps is not None
+    assert snapshot2.spread_bps > 0
+    assert snapshot2.depth_ratio is not None
+    assert snapshot2.obi_value == 0.35
+    assert snapshot2.ofi_value is not None  # OFI должен обновиться
     
-    # Flow метрики (из словаря cvd)
-    assert snapshot.whale_cvd == 50000.0
-    assert snapshot.dolphin_cvd == 10000.0
-    assert snapshot.fish_cvd == -5000.0
-    assert snapshot.total_cvd == 55000.0
+    # Flow метрики (теперь это ДЕЛЬТЫ!)
+    # WHY: FeatureCollector возвращает delta CVD для stationarity
+    # First call: initialized state (returned 0)
+    # Second call: delta = current - last
+    assert snapshot2.whale_cvd == 10000.0  # 60000 - 50000
+    assert snapshot2.dolphin_cvd == 2000.0  # 12000 - 10000
+    assert snapshot2.fish_cvd == -1000.0   # -6000 - (-5000)
+    assert snapshot2.total_cvd == 11000.0  # 10000 + 2000 + (-1000)
     
     # Derivatives метрики
-    assert snapshot.futures_basis_apr == 12.5
-    assert snapshot.basis_state == 'CONTANGO'  # WHY: basis_apr=12.5 → CONTANGO (10-20 range)
-    assert snapshot.options_skew == 6.8
-    assert snapshot.skew_state == 'FEAR'
+    assert snapshot2.futures_basis_apr == 12.5
+    assert snapshot2.basis_state == 'CONTANGO'  # WHY: basis_apr=12.5 → CONTANGO (10-20 range)
+    assert snapshot2.options_skew == 6.8
+    assert snapshot2.skew_state == 'FEAR'
     
     # Price метрики
-    assert snapshot.current_price is not None
-    assert snapshot.twap_5m is not None
-    assert snapshot.price_vs_twap_pct is not None
+    assert snapshot2.current_price is not None
+    assert snapshot2.twap_5m is not None
+    assert snapshot2.price_vs_twap_pct is not None
 
 
 @pytest.mark.asyncio
@@ -151,51 +172,55 @@ async def test_feature_collector_tolerates_missing_dependencies():
         derivatives_analyzer=None  # WHY: Нет derivatives
     )
     
-    # Act
-    snapshot = await collector.capture_snapshot()
+    # Act - FIRST call (initializes state)
+    snapshot1 = collector.capture_snapshot()
     
-    # Assert
-    assert snapshot is not None
+    # WHY: Изменяем CVD для второго вызова
+    book.whale_cvd['whale'] = 55000.0
+    book.whale_cvd['dolphin'] = 11000.0
+    book.whale_cvd['minnow'] = -5500.0
+    
+    # Act - SECOND call (returns deltas)
+    snapshot2 = collector.capture_snapshot()
+    
+    # Assert - Use SECOND snapshot
+    assert snapshot2 is not None
     
     # Orderbook метрики должны быть
-    assert snapshot.spread_bps is not None
-    assert snapshot.depth_ratio is not None
-    assert snapshot.obi_value == 0.35  # WHY: MockOrderBook.get_weighted_obi() возвращает 0.35
+    assert snapshot2.spread_bps is not None
+    assert snapshot2.depth_ratio is not None
+    assert snapshot2.obi_value == 0.35  # WHY: MockOrderBook.get_weighted_obi() возвращает 0.35
     
-    # Flow метрики должны быть (читаются из order_book)
-    assert snapshot.whale_cvd == 50000.0
-    assert snapshot.fish_cvd == -5000.0
-    assert snapshot.dolphin_cvd == 10000.0
-    assert snapshot.total_cvd == 55000.0
+    # Flow метрики (ДЕЛЬТЫ!)
+    assert snapshot2.whale_cvd == 5000.0  # 55000 - 50000
+    assert snapshot2.fish_cvd == -500.0   # -5500 - (-5000)
+    assert snapshot2.dolphin_cvd == 1000.0  # 11000 - 10000
+    assert snapshot2.total_cvd == 5500.0  # 5000 + (-500) + 1000
     
     # Derivatives метрики должны быть None
-    assert snapshot.futures_basis_apr is None
-    assert snapshot.basis_state is None
+    assert snapshot2.futures_basis_apr is None
+    assert snapshot2.basis_state is None
 
 
 @pytest.mark.asyncio
 async def test_ofi_calculation():
     """
-    WHY: Проверяем расчет Order Flow Imbalance.
+    WHY: Проверяем что OFI читается из book.calculate_ofi().
     
-    Теория: OFI = ΔBid - ΔAsk
-    Если bid увеличился на 20, а ask уменьшился на 5:
-    OFI = 20 - (-5) = 25 (давление покупателей)
+    FIX (Gemini Validation): OFI теперь берется напрямую из LocalOrderBook,
+    а не через update_ofi().
     """
     # Arrange
-    collector = FeatureCollector(order_book=MockOrderBook())
+    book = MockOrderBook()
+    book._ofi_value = 42.0  # Устанавливаем mock значение
+    collector = FeatureCollector(order_book=book)
     
     # Act
-    collector.update_ofi(bid_depth=100, ask_depth=80)  # Начальное состояние
-    collector.update_ofi(bid_depth=120, ask_depth=75)  # Bid +20, Ask -5
+    collector.capture_snapshot()  # Initialize state
+    snapshot = collector.capture_snapshot()
     
-    snapshot = await collector.capture_snapshot()
-    
-    # Assert
-    # ΔBid = 120 - 100 = 20
-    # ΔAsk = 75 - 80 = -5
-    # OFI = 20 - (-5) = 25
-    assert snapshot.ofi_value == 25
+    # Assert - OFI читается из book
+    assert snapshot.ofi_value == 42.0
 
 
 @pytest.mark.asyncio
@@ -211,8 +236,9 @@ async def test_twap_calculation():
     for p in prices:
         collector.update_price(p)
     
-    # Act
-    snapshot = await collector.capture_snapshot()
+    # Act - Two calls for delta
+    collector.capture_snapshot()  # Initialize state
+    snapshot = collector.capture_snapshot()  # Get delta
     
     # Assert
     expected_twap = sum(prices) / len(prices)  # 60015
@@ -241,8 +267,9 @@ async def test_price_vs_twap():
     for _ in range(5):
         collector.update_price(60000)
     
-    # Act
-    snapshot = await collector.capture_snapshot()
+    # Act - Two calls for delta
+    collector.capture_snapshot()  # Initialize state
+    snapshot = collector.capture_snapshot()  # Get delta
     
     # Assert
     # Current = 60100, TWAP = 60000
@@ -265,8 +292,9 @@ async def test_spread_calculation():
     book = MockOrderBook()
     collector = FeatureCollector(order_book=book)
     
-    # Act
-    snapshot = await collector.capture_snapshot()
+    # Act - Two calls for delta
+    collector.capture_snapshot()  # Initialize state
+    snapshot = collector.capture_snapshot()  # Get delta
     
     # Assert
     # spread = 60050 - 60000 = 50
@@ -290,7 +318,7 @@ async def test_depth_ratio():
     collector = FeatureCollector(order_book=book)
     
     # Act
-    snapshot = await collector.capture_snapshot()
+    snapshot = collector.capture_snapshot()
     
     # Assert
     assert snapshot.depth_ratio == 1.0
@@ -310,11 +338,23 @@ async def test_total_cvd_calculation():
     book = MockOrderBook()  # WHY: CVD читается из order_book.whale_cvd
     collector = FeatureCollector(order_book=book)
     
-    # Act
-    snapshot = await collector.capture_snapshot()
+    # Act - Two calls for delta
+    book = MockOrderBook()  # WHY: CVD читается из order_book.whale_cvd
+    collector = FeatureCollector(order_book=book)
     
-    # Assert
-    assert snapshot.total_cvd == 55000.0
+    collector.capture_snapshot()  # Initialize state
+    
+    # Изменяем CVD
+    book.whale_cvd['whale'] = 60000.0
+    book.whale_cvd['dolphin'] = 12000.0
+    book.whale_cvd['minnow'] = -6000.0
+    
+    snapshot = collector.capture_snapshot()  # Get delta (= actual delta)
+    
+    # Assert - Second call delta
+    # Whale: 10000, Dolphin: 2000, Fish: -1000
+    # Total: 10000 + 2000 + (-1000) = 11000
+    assert snapshot.total_cvd == 11000.0
 
 
 @pytest.mark.asyncio
@@ -327,7 +367,7 @@ async def test_empty_price_history():
     # Не добавляем цены
     
     # Act
-    snapshot = await collector.capture_snapshot()
+    snapshot = collector.capture_snapshot()
     
     # Assert
     assert snapshot.twap_5m is None

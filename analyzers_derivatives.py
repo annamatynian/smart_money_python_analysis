@@ -12,6 +12,9 @@ class DerivativesAnalyzer:
     """
     WHY: Анализ деривативов для метрик "умных денег" (старшие таймфреймы).
     
+    === MULTI-ASSET SUPPORT ===
+    Принимает AssetConfig для получения symbol и других параметров.
+    
     Теория (документ "Анализ данных смарт-мани", раздел 4):
     - Futures Basis: Перегрев/дно рынка (Contango vs Backwardation)
     - Options Skew: Страх институционалов (Put vs Call IV)
@@ -23,10 +26,22 @@ class DerivativesAnalyzer:
     - Макро-анализа фазы рынка
     """
     
-    def __init__(self):
-        """Initialize analyzer (stateless - no dependencies)."""
+    def __init__(self, config: Optional['AssetConfig'] = None):
+        """
+        WHY: Инициализация с конфигурацией актива для мульти-токен поддержки.
+        
+        Args:
+            config: AssetConfig (BTC_CONFIG, ETH_CONFIG, SOL_CONFIG)
+                    Если None - используется BTC_CONFIG по умолчанию (backward compatibility)
+        """
+        # WHY: Import here to avoid circular dependency
+        from config import AssetConfig, BTC_CONFIG
+        
+        self.config = config if config is not None else BTC_CONFIG
+        
         # WHY: Domain модель для GEX результатов (Clean Architecture)
         from domain import GammaProfile  # Import here to avoid circular dependency
+        
         # Кеш для FeatureCollector (неблокирующий доступ)
         self._cached_basis: Optional[float] = None
         self._cached_skew: Optional[float] = None
@@ -86,7 +101,8 @@ class DerivativesAnalyzer:
         expiry_years: List[float],
         ivs: List[float],
         open_interest: List[float],
-        underlying_price: float
+        underlying_price: float,
+        avg_daily_volume: Optional[float] = None  # NEW: Можно передать снаружи
     ):
         """
         WHY: Рассчитывает Gamma Exposure (GEX) для опционов.
@@ -176,10 +192,22 @@ class DerivativesAnalyzer:
         put_strikes = {k: v for k, v in strike_gex.items() if v < 0}
         put_wall = min(put_strikes.keys(), key=lambda k: put_strikes[k]) if put_strikes else None
         
+        # === GEMINI FIX: GEX Normalization ===
+        # Рассчитываем total_gex_normalized = total_gex / ADV_20d
+        total_gex_normalized = None
+        if avg_daily_volume is not None and avg_daily_volume > 0:
+            total_gex_normalized = total_gex / avg_daily_volume
+        
+        # === GEMINI FIX: Expiration Decay ===
+        # Используем статический метод GammaProfile для расчёта expiry
+        expiry_timestamp = GammaProfile.get_next_options_expiry()
+        
         return GammaProfile(
             total_gex=total_gex,
+            total_gex_normalized=total_gex_normalized,  # NEW
             call_wall=call_wall if call_wall else 0.0,
-            put_wall=put_wall if put_wall else 0.0
+            put_wall=put_wall if put_wall else 0.0,
+            expiry_timestamp=expiry_timestamp  # NEW
         )
     
     def calculate_options_skew(
@@ -436,16 +464,20 @@ class DerivativesAnalyzer:
         """
         WHY: Возвращает последний кешированный basis (без сетевых запросов).
         
+        === GEMINI FIX: Cache TTL Extension ===
+        TTL увеличен с 5 мин до 30 мин для макро-данных.
+        
         Returns:
             Cached basis APR или None если кеш пустой/устарел
         """
         if self._cached_basis is None:
             return None
         
-        # Проверяем свежесть (не старее 5 минут)
+        # Проверяем свежесть (не старее 30 минут)
         if self._last_basis_update:
             age = (datetime.now() - self._last_basis_update).total_seconds()
-            if age > 300:  # 5 минут
+            # FIX: Увеличено с 300 до 1800 сек (с 5 мин до 30 мин)
+            if age > 1800:
                 return None
         
         return self._cached_basis
@@ -454,16 +486,20 @@ class DerivativesAnalyzer:
         """
         WHY: Возвращает последний кешированный skew (без сетевых запросов).
         
+        === GEMINI FIX: Cache TTL Extension ===
+        TTL увеличен с 5 мин до 30 мин для макро-данных.
+        
         Returns:
             Cached skew или None если кеш пустой/устарел
         """
         if self._cached_skew is None:
             return None
         
-        # Проверяем свежесть (не старее 5 минут)
+        # Проверяем свежесть (не старее 30 минут)
         if self._last_skew_update:
             age = (datetime.now() - self._last_skew_update).total_seconds()
-            if age > 300:  # 5 минут
+            # FIX: Увеличено с 300 до 1800 сек (с 5 мин до 30 мин)
+            if age > 1800:
                 return None
         
         return self._cached_skew

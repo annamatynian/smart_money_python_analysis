@@ -25,11 +25,52 @@ class GammaProfile(BaseModel):
     """
     Новая структура данных.
     Источник: Ваша теория [cite: 120-125] и логика из файла deribit_loader.py.
+    
+    === GEMINI FIX: GEX Normalization + Expiration Decay ===
+    Добавлены поля для устранения Non-Stationarity и Expiration Cliff проблем.
     """
     total_gex: float      # Общая гамма (Барометр: гасят волатильность или разгоняют)
+    # NEW: Нормализованная гамма (GEX / ADV_20d). 1.0 = GEX равен дневному объему
+    total_gex_normalized: Optional[float] = None
     call_wall: float      # Уровень сопротивления (где дилеры продают)
     put_wall: float       # Уровень поддержки (где дилеры покупают)
     timestamp: datetime = Field(default_factory=datetime.now)
+    # NEW: Время ближайшей экспирации опционов (Friday 08:00 UTC)
+    expiry_timestamp: Optional[datetime] = None
+    
+    @staticmethod
+    def get_next_options_expiry() -> datetime:
+        """
+        WHY: Возвращает ближайшую пятницу 08:00 UTC (Deribit options expiry).
+        
+        === GEMINI FIX: Expiration Decay ===
+        Используется для заполнения поля expiry_timestamp при создании GammaProfile.
+        
+        Логика:
+        - Deribit опционы экспирируются каждую пятницу в 08:00 UTC
+        - Если сейчас пятница после 08:00 → следующая пятница
+        - Иначе → ближайшая будущая пятница
+        
+        Returns:
+            datetime: Ближайшая пятница 08:00 UTC
+        """
+        from datetime import timezone, timedelta
+        
+        now = datetime.now(timezone.utc)
+        
+        # weekday(): 0=Monday, 1=Tuesday, ..., 4=Friday
+        # Вычисляем дней до пятницы
+        days_ahead = (4 - now.weekday()) % 7
+        
+        # Если сегодня пятница (days_ahead=0) и уже прошло 08:00 → берем следующую пятницу
+        if days_ahead == 0 and now.hour >= 8:
+            days_ahead = 7
+        
+        # Находим дату пятницы
+        next_friday = now + timedelta(days=days_ahead)
+        
+        # Устанавливаем время 08:00:00 UTC
+        return next_friday.replace(hour=8, minute=0, second=0, microsecond=0)
 
 class PriceLevel(BaseModel):
     price: Decimal
@@ -41,7 +82,7 @@ class OrderBookUpdate(BaseModel):
     asks: List[Tuple[Decimal, Decimal]]
     first_update_id: Optional[int] = None  # U в Binance (первый update ID в этом пакете)
     final_update_id: Optional[int] = None  # u в Binance (последний update ID)
-    event_time: datetime = Field(default_factory=datetime.now)
+    event_time: int  # WHY: Биржевое время в миллисекундах (Fix: Timestamp Skew - Gemini Validation)
 
 class TradeEvent(BaseModel):
     """Модель события сделки (Trade)"""
@@ -65,6 +106,9 @@ class VolumeBucket(BaseModel):
     - Высокая (>0.7): Агрессоры информированы → риск пробоя айсберга
     - Низкая (<0.3): Поток шумный (розничный) → айсберг устоит
     
+    === GEMINI FIX: Real-Time VPIN & Freshness ===
+    Добавлены метаданные времени для решения проблемы "Frozen VPIN".
+    
     Источник: ТЗ "Flow Toxicity (VPIN)" в проекте.
     """
     bucket_size: Decimal  # Фиксированный размер корзины (в монетах токена)
@@ -73,13 +117,36 @@ class VolumeBucket(BaseModel):
     buy_volume: Decimal = Decimal("0")  # Накопленный объём покупок (taker купил)
     sell_volume: Decimal = Decimal("0")  # Накопленный объём продаж (taker продал)
     is_complete: bool = False  # True когда корзина заполнена
-    creation_time: datetime = Field(default_factory=datetime.now)
+    
+    # === GEMINI FIX: Временные метаданные ===
+    created_at: datetime = Field(default_factory=datetime.now)  # Время создания корзины
+    last_update_at: datetime = Field(default_factory=datetime.now)  # Время последней сделки
     
     model_config = ConfigDict(arbitrary_types_allowed=True)
     
     def total_volume(self) -> Decimal:
         """WHY: Общий объём корзины (buy + sell)"""
         return self.buy_volume + self.sell_volume
+    
+    def age_seconds(self, current_time: Optional[datetime] = None) -> float:
+        """
+        WHY: GEMINI FIX - Возвращает возраст корзины с момента последнего обновления.
+        
+        Используется для определения "свежести" VPIN:
+        - Если age > 300 сек (5 мин) → VPIN считается stale
+        - ML модель не должна использовать stale VPIN
+        
+        Args:
+            current_time: Текущее время (для тестирования). Если None, используется datetime.now()
+        
+        Returns:
+            float: Количество секунд с момента last_update_at
+        """
+        if current_time is None:
+            current_time = datetime.now()
+        
+        delta = current_time - self.last_update_at
+        return delta.total_seconds()
     
     def add_trade(self, trade: TradeEvent) -> Decimal:
         """
@@ -89,6 +156,8 @@ class VolumeBucket(BaseModel):
         1. Определяем направление (buy/sell) по is_buyer_maker
         2. Добавляем объём в соответствующую сторону
         3. Если total > bucket_size → закрываем корзину и возвращаем overflow
+        
+        === GEMINI FIX: Обновляем last_update_at ===
         
         Args:
             trade: Событие сделки
@@ -100,6 +169,9 @@ class VolumeBucket(BaseModel):
         # Если корзина уже закрыта - игнорируем
         if self.is_complete:
             return trade.quantity
+        
+        # GEMINI FIX: Обновляем timestamp последней активности
+        self.last_update_at = datetime.now()
         
         # Определяем направление
         # is_buyer_maker=False → taker купил (агрессивная покупка)
@@ -119,6 +191,7 @@ class VolumeBucket(BaseModel):
             # Проверяем закрытие
             if self.total_volume() >= self.bucket_size:
                 self.is_complete = True
+                # GEMINI FIX: Последнее обновление уже установлено выше
             
             return Decimal("0")  # Нет overflow
         
@@ -289,6 +362,73 @@ class IcebergLevel(BaseModel):
         # EXHAUSTED: >500ms - стена истощена
         else:
             return 'EXHAUSTED'
+    
+    # ========================================================================
+    # GEMINI FIX: Confidence Decay (Fix Zombie Icebergs)
+    # ========================================================================
+    
+    def get_decayed_confidence(
+        self, 
+        current_time: datetime, 
+        half_life_seconds: float = 300.0
+    ) -> float:
+        """
+        WHY: Экспоненциальное затухание confidence без рефиллов (Fix: Zombie Icebergs).
+        
+        ПРОБЛЕМА (Gemini Validation):
+        - Айсберги детектированные часы назад сохраняли высокий confidence
+        - ML features загрязнялись "призрачными" уровнями поддержки
+        - Модель обучалась на false positives
+        
+        РЕШЕНИЕ:
+        Формула: Conf(t) = Conf_initial · e^(-λ·Δt)
+        
+        где:
+        - Δt = current_time - last_update_time (секунды)
+        - λ = ln(2) / T_half (decay coefficient)
+        - T_half = период полураспада (half_life_seconds)
+        
+        Рекомендуемые half_life:
+        - Scalping: 30-60 сек (λ ≈ 0.012-0.023)
+        - Swing: 300-600 сек (λ ≈ 0.0012-0.0023)
+        - Position: 3600 сек (λ ≈ 0.0002)
+        
+        Args:
+            current_time: Текущее время (обычно datetime.now())
+            half_life_seconds: Период полураспада в секундах (default: 300 = 5 мин)
+        
+        Returns:
+            float: Decayed confidence (0.0-1.0)
+        
+        Example:
+            >>> # Айсберг confidence=0.9, не обновлялся 10 минут
+            >>> iceberg.confidence_score = 0.9
+            >>> iceberg.last_update_time = now - timedelta(minutes=10)
+            >>> decayed = iceberg.get_decayed_confidence(now, half_life_seconds=300)
+            >>> assert decayed < 0.3  # Упал до <0.3 за 2 периода полураспада
+        """
+        import math
+        
+        # 1. Вычисляем Delta-t (время без обновлений)
+        delta_t_seconds = (current_time - self.last_update_time).total_seconds()
+        
+        # 2. Защита от отрицательного времени (если часы рассинхронизированы)
+        if delta_t_seconds < 0:
+            return self.confidence_score  # Возвращаем исходный confidence
+        
+        # 3. Вычисляем λ (decay coefficient)
+        # λ = ln(2) / T_half
+        # При t = T_half → Conf = Conf_initial * 0.5
+        lambda_decay = math.log(2) / half_life_seconds
+        
+        # 4. Экспоненциальное затухание
+        # Conf(t) = Conf_initial * e^(-λ * Δt)
+        decayed_confidence = self.confidence_score * math.exp(-lambda_decay * delta_t_seconds)
+        
+        # 5. Ограничиваем диапазон [0.0, 1.0]
+        decayed_confidence = max(0.0, min(1.0, decayed_confidence))
+        
+        return decayed_confidence
     
     # ========================================================================
     # GEMINI ENHANCEMENT #1: Relative Depth Absorption
@@ -1375,7 +1515,7 @@ class LocalOrderBook(BaseModel):
             price, qty = self.asks.peekitem(i)
             self.previous_ask_snapshot[price] = qty
     
-    def calculate_ofi(self, depth: int = None) -> float:
+    def calculate_ofi(self, depth: int = None, use_weighted: bool = False) -> float:
         """
         WHY: Вычисляет Order Flow Imbalance (OFI) - изменение ликвидности.
         
@@ -1390,8 +1530,30 @@ class LocalOrderBook(BaseModel):
         === UPDATE (Task: Gemini Phase 2.2 - Dynamic OFI Depth) ===
         Теперь использует config.ofi_depth по умолчанию.
         
+        === UPDATE (Task: Weighted OFI - Fix Depth Bias Vulnerability) ===
+        Добавлен параметр use_weighted для фильтрации спуфинга на дальних уровнях.
+        
+        Weighted Formula:
+        OFI_weighted = Σ(Δvolume_i × e^(-λ × distance_pct))
+        
+        где:
+        - λ (lambda) = config.lambda_decay (BTC=0.1, ETH=0.15)
+        - distance_pct = |price - mid| / mid × 100
+        - Дальние уровни (спуфы) затухают быстрее
+        
+        ⚠️ WARNING - PRODUCTION CALIBRATION (Gemini Validation):
+        Текущая формула использует lambda_decay_scaled = lambda * 100.0
+        При λ=0.1 и distance=0.1% → weight ≈ 0.36 (штраф 64%!)
+        
+        РИСК: Может отсекать реальную ликвидность близко к спреду.
+        РЕШЕНИЕ: Если метрики "тихие" на реальных данных:
+        - Уменьшить lambda_decay в config (0.01-0.05)
+        - ИЛИ убрать множитель ×100 (см. CALIBRATION_NOTES.md)
+        
         Args:
             depth: Глубина анализа. Если None - берётся из config.ofi_depth
+            use_weighted: True = экспоненциальное затухание по глубине (фильтрует спуфинг)
+                         False = все уровни равны (legacy)
         
         Returns:
             float: OFI значение (положительное = давление покупателей)
@@ -1399,10 +1561,25 @@ class LocalOrderBook(BaseModel):
         # WHY: Если depth не передан - берём из config
         if depth is None:
             depth = self.config.ofi_depth
-        # Если это первый update - нет предыдущего состояния
-        # === DOUBLE BUFFERING: Буферы всегда dict, проверяем пустые ===
-        if not self.previous_bid_snapshot or not self.previous_ask_snapshot:
-            return 0.0
+        
+        # === FIX: Убираем проверку на пустоту ===
+        # WHY: Пустой dict {} - это ВАЛИДНОЕ состояние (стакан был пустой)
+        # Проверка "if not {}" убивала логику для пустых стаканов
+        # Теперь OFI корректно работает с первого update
+        
+        # === WEIGHTED OFI: Получаем параметры для decay ===
+        mid_price = self.get_mid_price()
+        if mid_price is None and use_weighted:
+            # Fallback: если нет mid_price - используем unweighted
+            use_weighted = False
+        
+        lambda_decay = 0.1  # DEFAULT
+        if use_weighted and hasattr(self.config, 'lambda_decay'):
+            lambda_decay = float(self.config.lambda_decay)
+        
+        # WHY: Масштабируем λ для процентных расстояний (×100)
+        # Это даёт радикальную фильтрацию спуфинга на дальних уровнях
+        lambda_decay_scaled = lambda_decay * 100.0
         
         delta_bid_volume = 0.0
         delta_ask_volume = 0.0
@@ -1414,12 +1591,34 @@ class LocalOrderBook(BaseModel):
         for price, current_qty in current_bids.items():
             previous_qty = self.previous_bid_snapshot.get(price, Decimal("0"))
             delta = float(current_qty - previous_qty)
+            
+            # === WEIGHTED: Применяем exponential decay ===
+            if use_weighted:
+                # Расчёт расстояния в % от mid
+                distance_from_mid = abs(float(mid_price - price))
+                distance_pct = (distance_from_mid / float(mid_price)) * 100.0
+                
+                # Exponential weight: e^(-λ × distance_pct)
+                from math import exp
+                weight = exp(-lambda_decay_scaled * distance_pct)
+                delta *= weight
+            
             delta_bid_volume += delta
         
         # Проверяем удаленные уровни (были в previous, нет в current)
         for price, previous_qty in self.previous_bid_snapshot.items():
             if price not in current_bids:
-                delta_bid_volume -= float(previous_qty)
+                delta = -float(previous_qty)
+                
+                # === WEIGHTED: Применяем decay к удалённым уровням ===
+                if use_weighted:
+                    distance_from_mid = abs(float(mid_price - price))
+                    distance_pct = (distance_from_mid / float(mid_price)) * 100.0
+                    from math import exp
+                    weight = exp(-lambda_decay_scaled * distance_pct)
+                    delta *= weight
+                
+                delta_bid_volume += delta
         
         # 2. Анализируем изменения ASKS
         current_asks = dict(sorted(self.asks.items())[:depth])
@@ -1427,12 +1626,31 @@ class LocalOrderBook(BaseModel):
         for price, current_qty in current_asks.items():
             previous_qty = self.previous_ask_snapshot.get(price, Decimal("0"))
             delta = float(current_qty - previous_qty)
+            
+            # === WEIGHTED: Применяем exponential decay ===
+            if use_weighted:
+                distance_from_mid = abs(float(price - mid_price))
+                distance_pct = (distance_from_mid / float(mid_price)) * 100.0
+                from math import exp
+                weight = exp(-lambda_decay_scaled * distance_pct)
+                delta *= weight
+            
             delta_ask_volume += delta
         
         # Проверяем удаленные уровни
         for price, previous_qty in self.previous_ask_snapshot.items():
             if price not in current_asks:
-                delta_ask_volume -= float(previous_qty)
+                delta = -float(previous_qty)
+                
+                # === WEIGHTED: Применяем decay ===
+                if use_weighted:
+                    distance_from_mid = abs(float(price - mid_price))
+                    distance_pct = (distance_from_mid / float(mid_price)) * 100.0
+                    from math import exp
+                    weight = exp(-lambda_decay_scaled * distance_pct)
+                    delta *= weight
+                
+                delta_ask_volume += delta
         
         # 3. Расчет OFI = dBid - dAsk
         # Положительное значение = больше bid ликвидности добавлено
@@ -1705,6 +1923,82 @@ class LocalOrderBook(BaseModel):
         cvd_end = recent[-1][1]
         
         return cvd_end - cvd_start
+    
+    # ========================================================================
+    # GEMINI FIX: Zombie Icebergs Cleanup (Fix: Zombie Icebergs)
+    # ========================================================================
+    
+    def cleanup_old_icebergs(
+        self,
+        current_time: datetime,
+        half_life_seconds: float = 300.0,
+        min_confidence: float = 0.1
+    ) -> int:
+        """
+        WHY: Периодическая очистка зомби-айсбергов с низким decayed confidence.
+        
+        ПРОБЛЕМА (Gemini Validation):
+        - Айсберги без обновлений накапливались в реестре
+        - Память росла без ограничений
+        - ML features загрязнялись устаревшими данными
+        
+        РЕШЕНИЕ:
+        - Вызывается периодически (например, раз в минуту)
+        - Вычисляет decayed_confidence для каждого айсберга
+        - Удаляет айсберги с confidence < min_confidence
+        
+        ИСПОЛЬЗОВАНИЕ:
+        ```python
+        # В main loop (services.py):
+        if time.time() - last_cleanup_time > 60:  # Каждую минуту
+            removed_count = order_book.cleanup_old_icebergs(
+                current_time=datetime.now(),
+                half_life_seconds=300,
+                min_confidence=0.1
+            )
+            print(f"Cleaned up {removed_count} zombie icebergs")
+            last_cleanup_time = time.time()
+        ```
+        
+        Args:
+            current_time: Текущее время (datetime.now())
+            half_life_seconds: Период полураспада (default: 300 = swing)
+            min_confidence: Минимальный порог confidence (default: 0.1)
+        
+        Returns:
+            int: Количество удалённых айсбергов
+        
+        Example:
+            >>> # У нас есть 3 айсберга
+            >>> book.active_icebergs = {
+            ...     Decimal('60000'): IcebergLevel(..., last_update=now - timedelta(minutes=20)),
+            ...     Decimal('60100'): IcebergLevel(..., last_update=now - timedelta(minutes=1)),
+            ...     Decimal('60200'): IcebergLevel(..., last_update=now - timedelta(minutes=30))
+            ... }
+            >>> removed = book.cleanup_old_icebergs(now, half_life_seconds=300, min_confidence=0.1)
+            >>> assert removed == 2  # Удалены 2 старых айсберга (20 мин и 30 мин)
+        """
+        removed_count = 0
+        icebergs_to_remove = []
+        
+        # 1. Проверяем каждый айсберг
+        for price, iceberg in self.active_icebergs.items():
+            # 2. Вычисляем decayed confidence
+            decayed_confidence = iceberg.get_decayed_confidence(
+                current_time,
+                half_life_seconds=half_life_seconds
+            )
+            
+            # 3. Помечаем для удаления если confidence слишком низкий
+            if decayed_confidence < min_confidence:
+                icebergs_to_remove.append(price)
+        
+        # 4. Удаляем айсберги (отдельным проходом чтобы не модифицировать dict во время итерации)
+        for price in icebergs_to_remove:
+            del self.active_icebergs[price]
+            removed_count += 1
+        
+        return removed_count
 
 
 # ===========================================================================

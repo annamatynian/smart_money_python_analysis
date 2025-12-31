@@ -250,6 +250,7 @@ class BinanceInfrastructure(IMarketDataSource):
             yield OrderBookUpdate(
                 first_update_id=data['U'],
                 final_update_id=data['u'],
+                event_time=data['E'],  # WHY: Биржевое Event Time (Fix: Timestamp Skew)
                 bids=[(Decimal(p), Decimal(q)) for p, q in data.get('b', [])],
                 asks=[(Decimal(p), Decimal(q)) for p, q in data.get('a', [])]
             )
@@ -333,6 +334,7 @@ class BinanceMockInfrastructure(IMarketDataSource):
             yield OrderBookUpdate(
                 first_update_id=update_id,
                 final_update_id=update_id,
+                event_time=int(time.time() * 1000),  # WHY: Реалистичное время для тестов
                 bids=[(Decimal("60000.00"), Decimal("1.6"))],  # Увеличили объем на bid
                 asks=[]
             )
@@ -643,3 +645,79 @@ class DeribitInfrastructure:
         except Exception as e:
             # print(f"Skew calculation error: {e}")
             return None
+
+
+# ===========================================================================
+# HELPER FUNCTIONS: Volume & Market Data
+# ===========================================================================
+
+async def get_average_daily_volume(
+    symbol: str,  # ОБЯЗАТЕЛЬНЫЙ параметр (multi-asset support)
+    days: int = 20,
+    exchange: str = "binance"
+) -> Optional[float]:
+    """
+    WHY: Получить средний дневной объём за последние N дней для нормализации GEX.
+    
+    === GEMINI FIX: GEX Normalization ===
+    Используется для расчёта total_gex_normalized = total_gex / ADV_20d.
+    
+    === MULTI-ASSET SUPPORT ===
+    Symbol ОБЯЗАТЕЛЕН - нет дефолтов для BTC/ETH/SOL.
+    
+    Логика:
+    - Запрос к Binance Klines API для получения дневных свечей
+    - Извлечение volume из каждой свечи
+    - Расчёт среднего за N дней
+    
+    Args:
+        symbol: Торговая пара ("BTCUSDT", "ETHUSDT", "SOLUSDT" и т.д.) - ОБЯЗАТЕЛЬНО!
+        days: Количество дней для усреднения (default: 20)
+        exchange: Биржа (default: "binance")
+    
+    Returns:
+        Средний дневной объём в USD или None при ошибке
+    
+    Example:
+        >>> adv_20d = await get_average_daily_volume("BTCUSDT", days=20)
+        >>> # adv_20d ≈ 2_000_000_000.0 (2B USD)
+        >>> 
+        >>> # Для ETH
+        >>> adv_eth = await get_average_daily_volume("ETHUSDT", days=20)
+    """
+    if exchange == "binance":
+        url = "https://api.binance.com/api/v3/klines"
+        params = {
+            "symbol": symbol,
+            "interval": "1d",  # Дневные свечи
+            "limit": days      # Последние N дней
+        }
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params) as resp:
+                    if resp.status != 200:
+                        return None
+                    
+                    data = await resp.json()
+            
+            if not data or len(data) < days:
+                return None
+            
+            # Klines format: [timestamp, open, high, low, close, volume, ...]
+            # Volume находится на индексе 5
+            volumes = [float(candle[5]) * float(candle[4]) for candle in data]  # volume * close_price = USD volume
+            
+            # Средний дневной объём
+            avg_volume = sum(volumes) / len(volumes)
+            
+            return avg_volume
+            
+        except Exception as e:
+            # Логирование ошибки (опционально)
+            # print(f"ADV calculation error for {symbol}: {e}")
+            return None
+    
+    else:
+        # TODO: Поддержка других бирж (Deribit, OKX, etc.)
+        return None

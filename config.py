@@ -36,7 +36,11 @@ class AssetConfig:
     breach_tolerance_pct: Decimal       # % толеранс для пробоя
     
     # --- 6. OBI Exponential Decay ---
-    lambda_decay: float = 0.1           # Коэффициент экспоненциального затухания (WHY: Task - Dynamic Lambda)
+    # ⚠️ PRODUCTION CALIBRATION WARNING (Gemini Validation):
+    # lambda_decay используется в weighted OFI с множителем ×100
+    # При λ=0.1: ордер на 0.1% от mid получает weight=0.36 (штраф 64%)
+    # Если OFI "тихий" - уменьши до 0.01-0.05 (см. CALIBRATION_NOTES.md)
+    lambda_decay: float = 0.1           # Коэффициент экспоненциального затухания
     
     # --- 7. OFI Depth ---
     ofi_depth: int = 20                 # Глубина расчёта OFI (WHY: Gemini Phase 2.2 - Dynamic Depth)
@@ -46,6 +50,10 @@ class AssetConfig:
     vpin_window_size: int = 50                  # Количество корзин в скользящем окне
     vpin_toxicity_threshold: float = 0.7        # Порог токсичности (>0.7 = toxic flow)
     vpin_noise_threshold: float = 0.3           # Порог шума (<0.3 = noisy flow)
+    
+    # === GEMINI FIX: Real-Time VPIN Parameters ===
+    vpin_inclusion_threshold: float = 0.2       # WHY: Включать current_bucket если заполнен > 20%
+    vpin_stale_threshold_seconds: int = 300     # WHY: Считать VPIN stale через 5 мин простоя (swing trading)
 
 # --- КОНФИГУРАЦИИ ---
 
@@ -118,7 +126,7 @@ SOL_CONFIG = AssetConfig(
     price_display_format="{:,.3f}",   # 145.235 (больше точности)
     min_hidden_volume=Decimal("10.0"),
     min_iceberg_ratio=Decimal("0.3"),
-    gamma_wall_tolerance_pct=Decimal("0.002"),
+    gamma_wall_tolerance_pct=Decimal("0.005"),  # WHY: Gemini - SOL lower liquidity → wider tolerance (0.5%)
     static_whale_threshold_usd=25000.0,
     static_minnow_threshold_usd=200.0,
     min_whale_floor_usd=2000.0,

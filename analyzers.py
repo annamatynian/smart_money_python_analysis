@@ -274,7 +274,18 @@ class IcebergAnalyzer:
         adjusted = base_confidence
         is_major_event = False
         
-        # === ФАЗА 1: GEX ADJUSTMENT ===
+        # === GEMINI FIX: EXPIRATION DECAY ===
+        # WHY: Устраняем "Expiration Cliff" проблему (Friday 08:00 UTC trap)
+        decay_factor = 1.0
+        if gamma_profile and gamma_profile.expiry_timestamp:
+            from datetime import timezone
+            # Считаем часы до экспирации
+            hours_left = (gamma_profile.expiry_timestamp - datetime.now(timezone.utc)).total_seconds() / 3600
+            if 0 < hours_left < 2.0:
+                # Линейное затухание: за 2 часа до экспирации влияние падает с 100% до 0%
+                decay_factor = hours_left / 2.0
+        
+        # === ФАЗА 1: GEX ADJUSTMENT (GEMINI FIX: Normalization) ===
         if gamma_profile is not None:
             # 1. Проверяем близость к Gamma Walls
             price_float = float(price)
@@ -287,25 +298,40 @@ class IcebergAnalyzer:
             
             is_on_gamma_wall = on_call_wall or on_put_wall
             
-            # 3. ПОЛОЖИТЕЛЬНАЯ ГАММА: Дилеры гасят волатильность
-            if gamma_profile.total_gex > 0:
-                if is_on_gamma_wall:
-                    # Айсберг НА gamma wall при +GEX = максимальная надежность
-                    adjusted = adjusted * 1.8  # x1.8 multiplier
-                    is_major_event = True
-                else:
-                    # Обычный айсберг при +GEX = умеренное повышение
-                    adjusted = adjusted * 1.2  # x1.2 multiplier
+            # === GEMINI FIX: GEX NORMALIZATION ===
+            # WHY: Используем normalized GEX вместо абсолютного значения
+            # Порог 0.1 означает GEX > 10% от дневного объема
+            gex_significant = (
+                gamma_profile.total_gex_normalized is not None and
+                abs(gamma_profile.total_gex_normalized) > 0.1
+            )
             
-            # 4. ОТРИЦАТЕЛЬНАЯ ГАММА: Gamma Squeeze режим
-            elif gamma_profile.total_gex < 0:
-                if is_on_gamma_wall:
-                    # Айсберг на gamma wall при -GEX = все еще значим, но менее надежен
-                    adjusted = adjusted * 1.3  # x1.3 (меньше чем при +GEX)
-                    is_major_event = True
-                else:
-                    # Обычный айсберг при -GEX = снижение надежности
-                    adjusted = adjusted * 0.75  # x0.75 (рынок нестабилен)
+            # Применяем GEX adjustment только если GEX значимый
+            if gex_significant:
+                # 3. ПОЛОЖИТЕЛЬНАЯ ГАММА: Дилеры гасят волатильность
+                if gamma_profile.total_gex > 0:
+                    if is_on_gamma_wall:
+                        # Айсберг НА gamma wall при +GEX = максимальная надежность
+                        # Применяем decay к бонусу: если скоро экспирация, бонус исчезает
+                        bonus = 0.8 * decay_factor  # Максимум x1.8 (1.0 + 0.8)
+                        adjusted = adjusted * (1.0 + bonus)
+                        is_major_event = True
+                    else:
+                        # Обычный айсберг при +GEX = умеренное повышение
+                        bonus = 0.2 * decay_factor  # Максимум x1.2 (1.0 + 0.2)
+                        adjusted = adjusted * (1.0 + bonus)
+                
+                # 4. ОТРИЦАТЕЛЬНАЯ ГАММА: Gamma Squeeze режим
+                elif gamma_profile.total_gex < 0:
+                    if is_on_gamma_wall:
+                        # Айсберг на gamma wall при -GEX = все еще значим, но менее надежен
+                        bonus = 0.3 * decay_factor  # Максимум x1.3 (1.0 + 0.3)
+                        adjusted = adjusted * (1.0 + bonus)
+                        is_major_event = True
+                    else:
+                        # Обычный айсберг при -GEX = снижение надежности
+                        penalty = 0.25 * decay_factor  # Минимум x0.75 (1.0 - 0.25)
+                        adjusted = adjusted * (1.0 - penalty)
         
         # === ФАЗА 2: VPIN ADJUSTMENT (НОВОЕ) ===
         if vpin_score is not None:
@@ -1488,8 +1514,17 @@ class FlowToxicityAnalyzer:
         """
         WHY: Рассчитывает текущий VPIN на основе истории корзин.
         
-        Формула:
-        VPIN = Σ|Buy_i - Sell_i| / (n * bucket_size)
+        === GEMINI FIX: Real-Time VPIN ===
+        Теперь учитывает current_vpin_bucket если она заполнена >20%.
+        
+        Формула (Volume-Weighted):
+        VPIN = Σ|OI_i| / ΣV_i
+        
+        Где:
+        - |OI_i| = abs(buy - sell) в корзине i
+        - V_i = total_volume корзины i
+        
+        Это позволяет корректно объединять полные и неполные корзины.
         
         Returns:
             float: VPIN значение (0.0-1.0), или None если корзин < 10
@@ -1498,24 +1533,117 @@ class FlowToxicityAnalyzer:
         if len(self.book.vpin_buckets) < 10:
             return None
         
-        # Считаем сумму дисбалансов
-        total_imbalance = sum(
-            bucket.calculate_imbalance() 
-            for bucket in self.book.vpin_buckets
-        )
+        # === GEMINI FIX: Собираем ВСЕ корзины (история + текущая) ===
+        buckets_to_include = list(self.book.vpin_buckets)  # Копия истории
         
-        # Знаменатель формулы
-        n = len(self.book.vpin_buckets)
-        denominator = n * self.bucket_size
+        # Проверяем текущую корзину
+        if self.book.current_vpin_bucket is not None:
+            # Рассчитываем % заполнения
+            current_volume = self.book.current_vpin_bucket.total_volume()
+            if self.bucket_size > 0:
+                fill_percentage = float(current_volume / self.bucket_size)
+                
+                # WHY: Из config.py - vpin_inclusion_threshold = 0.2 (20%)
+                from config import get_config
+                config = get_config(self.book.symbol)
+                
+                # Если заполнена больше порога - включаем
+                if fill_percentage >= config.vpin_inclusion_threshold:
+                    buckets_to_include.append(self.book.current_vpin_bucket)
         
-        # Защита от деления на 0
-        if denominator == 0:
+        # Если после добавления current bucket меньше 10 - выходим
+        if len(buckets_to_include) < 10:
             return None
         
-        vpin = float(total_imbalance / denominator)
+        # === VOLUME-WEIGHTED FORMULA ===
+        # WHY: Корзины могут быть разного размера (полные + частичная)
+        total_imbalance = Decimal("0")
+        total_volume = Decimal("0")
+        
+        for bucket in buckets_to_include:
+            total_imbalance += bucket.calculate_imbalance()
+            total_volume += bucket.total_volume()
+        
+        # Защита от деления на 0
+        if total_volume == 0:
+            return None
+        
+        # VPIN = sum(|imbalance|) / sum(volume)
+        vpin = float(total_imbalance / total_volume)
         
         # Обрезаем до [0.0, 1.0]
         return max(0.0, min(1.0, vpin))
+    
+    def get_vpin_status(self, current_time: Optional[datetime] = None) -> dict:
+        """
+        WHY: GEMINI FIX - Возвращает статус VPIN со свежестью.
+        
+        Используется ML-моделью для фильтрации stale VPIN:
+        - Если is_stale = True → не использовать в обучении
+        - Если freshness > 300с (5 мин) → VPIN устарел
+        
+        Args:
+            current_time: Текущее время (для тестирования)
+        
+        Returns:
+            dict: {
+                'vpin': float | None,
+                'is_stale': bool,
+                'freshness': float,  # секунд с последней сделки
+                'buckets_used': int
+            }
+        """
+        if current_time is None:
+            current_time = datetime.now()
+        
+        # Рассчитываем VPIN
+        vpin = self.get_current_vpin()
+        
+        # === ОПРЕДЕЛЯЕМ СВЕЖЕСТЬ ===
+        freshness_seconds = 0.0
+        is_stale = True  # default: считаем stale пока не доказано обратное
+        
+        # Находим самую свежую корзину
+        most_recent_bucket = None
+        
+        # 1. Проверяем current_bucket (он самый свежий если есть)
+        if self.book.current_vpin_bucket is not None:
+            most_recent_bucket = self.book.current_vpin_bucket
+        # 2. Иначе берём последнюю из истории
+        elif len(self.book.vpin_buckets) > 0:
+            most_recent_bucket = self.book.vpin_buckets[-1]  # Последняя в списке
+        
+        # Если нашли корзину
+        if most_recent_bucket is not None:
+            freshness_seconds = most_recent_bucket.age_seconds(current_time)
+            
+            # WHY: Из config.py - vpin_stale_threshold_seconds = 300 (5 мин)
+            from config import get_config
+            config = get_config(self.book.symbol)
+            
+            # Проверяем stale
+            if freshness_seconds <= config.vpin_stale_threshold_seconds:
+                is_stale = False
+        
+        # Считаем количество корзин
+        buckets_used = len(self.book.vpin_buckets)
+        
+        # Добавляем current если она была включена в get_current_vpin()
+        if self.book.current_vpin_bucket is not None:
+            current_volume = self.book.current_vpin_bucket.total_volume()
+            if self.bucket_size > 0:
+                fill_percentage = float(current_volume / self.bucket_size)
+                from config import get_config
+                config = get_config(self.book.symbol)
+                if fill_percentage >= config.vpin_inclusion_threshold:
+                    buckets_used += 1
+        
+        return {
+            'vpin': vpin,
+            'is_stale': is_stale,
+            'freshness': freshness_seconds,
+            'buckets_used': buckets_used
+        }
     
     def is_flow_toxic(self, threshold: float = 0.7) -> bool:
         """

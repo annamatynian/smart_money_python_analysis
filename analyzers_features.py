@@ -147,21 +147,18 @@ class FeatureCollector:
         # Price history для TWAP/volatility (5 минут при 1 сек)
         self.price_history: deque = deque(maxlen=300)
         
-        # OFI tracking (для Order Flow Imbalance)
-        self._prev_bid_depth: Optional[float] = None
-        self._prev_ask_depth: Optional[float] = None
-        self._ofi_value: float = 0.0
+        # === FIX VULNERABILITY A: CVD Stationarity (State-based Delta) ===
+        # WHY: Предотвращает non-stationary features в ML
+        # Теория: ML модели требуют ДЕЛЬТУ CVD между событиями, а не абсолютный счетчик
+        # Решение: Хранить last value, возвращать current - last
+        self._last_whale_cvd: float = 0.0
+        self._last_minnow_cvd: float = 0.0
+        self._last_dolphin_cvd: float = 0.0
         
         # === НОВОЕ: Derivatives cache (ШАГ 6.5) ===
         # WHY: Кешируем basis/skew для неблокирующего capture_snapshot()
         self.cached_basis: Optional[float] = None  # Обновляется через _feed_derivatives_cache()
         self.cached_skew: Optional[float] = None   # Обновляется через _feed_derivatives_cache()
-        
-        # === НОВОЕ: ADAPTIVE THROTTLING (Gemini рекомендация) ===
-        # WHY: Предотвращаем перегрузку БД при лавинообразных рефиллах айсбергов
-        self._last_snapshot_time: Optional[datetime] = None
-        self._last_snapshot_cache: Optional[FeatureSnapshot] = None
-        self.throttle_interval_ms: int = 100  # Минимальный интервал между снапшотами
     
     def update_price(self, price: float):
         """
@@ -174,59 +171,34 @@ class FeatureCollector:
             'price': price
         })
     
-    def update_ofi(self, bid_depth: float, ask_depth: float):
-        """
-        WHY: Обновляет Order Flow Imbalance.
-        
-        Теория: OFI = ΔBid - ΔAsk (изменение объемов на лучших уровнях).
-        Положительный OFI → давление покупателей.
-        
-        Args:
-            bid_depth: Объем на best bid
-            ask_depth: Объем на best ask
-        """
-        if self._prev_bid_depth is not None:
-            delta_bid = bid_depth - self._prev_bid_depth
-            delta_ask = ask_depth - self._prev_ask_depth
-            
-            self._ofi_value = delta_bid - delta_ask
-        
-        self._prev_bid_depth = bid_depth
-        self._prev_ask_depth = ask_depth
-    
     def capture_snapshot(
         self,
-        historical_memory: Optional['HistoricalMemory'] = None
+        historical_memory: Optional['HistoricalMemory'] = None,
+        iceberg: Optional['IcebergLevel'] = None
     ) -> FeatureSnapshot:
         """
         WHY: Собирает текущее состояние ВСЕХ метрик.
+        
+        FIX VULNERABILITY A: Throttling удален - теперь ВСЕГДА возвращает свежие данные.
         
         Гарантии:
         - Неблокирующий (только чтение из памяти)
         - Никаких сетевых запросов
         - Толерантен к отсутствию данных (возвращает None)
-        - THROTTLED: не чаще раза в 100 мс (предотвращает перегрузку БД)
+        - Всегда обновляет state для CVD delta (критично!)
+        
+        Args:
+            historical_memory: Исторические данные для whale CVD trends
+            iceberg: Айсберг для spoofing features (опционально)
         
         Returns:
             FeatureSnapshot с заполненными полями (None если метрика недоступна)
         """
         now = datetime.now(timezone.utc)
         
-        # === ADAPTIVE THROTTLING: Проверка elapsed time ===
-        # WHY: При лавинообразных рефиллах айсбергов может быть сотни событий в секунду
-        # Чтобы не перегружать БД, возвращаем кешированный снапшот если < 100 мс
-        if self._last_snapshot_time is not None:
-            elapsed_ms = (now - self._last_snapshot_time).total_seconds() * 1000
-            
-            if elapsed_ms < self.throttle_interval_ms:
-                # Слишком рано - возвращаем кешированный снапшот
-                if self._last_snapshot_cache is not None:
-                    return self._last_snapshot_cache
-                # Если кеша нет (первый вызов) - продолжаем создание
-        
         # === ORDERBOOK METRICS ===
         obi = self._get_obi()
-        ofi = self._ofi_value
+        ofi = self._get_ofi()  # FIX: Читаем напрямую из book, как OBI и CVD
         spread_bps = self._get_spread_bps()
         depth_ratio = self._get_depth_ratio()
         
@@ -234,7 +206,8 @@ class FeatureCollector:
         whale_cvd = self._get_whale_cvd()
         fish_cvd = self._get_fish_cvd()
         dolphin_cvd = self._get_dolphin_cvd()
-        total_cvd = self._get_total_cvd()
+        # WHY: Используем уже вычисленные значения вместо повторного вызова методов
+        total_cvd = self._calculate_total_cvd(whale_cvd, fish_cvd, dolphin_cvd)
         whale_cvd_delta = self._get_whale_cvd_delta(minutes=5)
         
         # === DERIVATIVES METRICS ===
@@ -252,7 +225,13 @@ class FeatureCollector:
         volatility_1h = self._calculate_volatility(minutes=60)
         
         # === SPOOFING ===
-        spoofing_score = None  # Заполняется через iceberg.spoofing_probability
+        # GEMINI FIX: Используем decayed confidence если iceberg передан
+        spoofing_score = None
+        if iceberg is not None:
+            # Используем get_iceberg_features() для получения decayed confidence
+            iceberg_features = self.get_iceberg_features(iceberg, now, half_life_seconds=300)
+            spoofing_score = iceberg_features['spoofing_probability']
+        
         cancel_ratio = None  # TODO: Добавить когда будет tracking отмен
         
         # === VPIN (НОВОЕ) ===
@@ -338,12 +317,92 @@ class FeatureCollector:
             whale_cvd_trend_6m=whale_cvd_trend_6m
         )
         
-        # === UPDATE THROTTLING CACHE ===
-        # WHY: Сохраняем снапшот для быстрого возврата при повторных вызовах < 100 мс
-        self._last_snapshot_time = now
-        self._last_snapshot_cache = snapshot
-        
         return snapshot
+    
+    # ========================================================================
+    # GEMINI FIX: Iceberg Confidence with Decay (Fix Zombie Icebergs)
+    # ========================================================================
+    
+    def get_iceberg_features(
+        self,
+        iceberg: 'IcebergLevel',
+        current_time: datetime,
+        half_life_seconds: float = 300.0
+    ) -> dict:
+        """
+        WHY: Извлекает features айсберга с DECAYED confidence (Fix: Zombie Icebergs).
+        
+        ПРОБЛЕМА (Gemini Validation):
+        - Раньше: confidence = iceberg.confidence_score (статический)
+        - ML features загрязнялись зомби-айсбергами
+        
+        РЕШЕНИЕ:
+        - Теперь: confidence = iceberg.get_decayed_confidence(now)
+        - Айсберги без обновлений автоматически теряют confidence
+        
+        ИСПОЛЬЗОВАНИЕ:
+        ```python
+        # При сохранении в БД или ML features:
+        for price, iceberg in order_book.active_icebergs.items():
+            features = feature_collector.get_iceberg_features(
+                iceberg, 
+                current_time=datetime.now(),
+                half_life_seconds=300  # 5 мин для swing
+            )
+            
+            # features['confidence'] = decayed confidence
+            # features['is_significant'] = True если confidence > 0.3
+        ```
+        
+        Args:
+            iceberg: IcebergLevel для анализа
+            current_time: Текущее время (datetime.now())
+            half_life_seconds: Период полураспада (default: 300 = swing)
+        
+        Returns:
+            dict: {
+                'confidence': float (decayed),
+                'confidence_raw': float (исходный),
+                'is_significant': bool (confidence > 0.3),
+                'time_since_update_sec': float,
+                'refill_count': int,
+                'refill_frequency': float,
+                'is_gamma_wall': bool,
+                'spoofing_probability': float
+            }
+        
+        Example:
+            >>> iceberg = IcebergLevel(
+            ...     price=Decimal('60000'),
+            ...     confidence_score=0.9,
+            ...     last_update_time=now - timedelta(minutes=10)
+            ... )
+            >>> features = collector.get_iceberg_features(iceberg, now)
+            >>> assert features['confidence'] < 0.3  # Decayed!
+            >>> assert features['is_significant'] == False  # Filtered out
+        """
+        # 1. Вычисляем decayed confidence
+        decayed_confidence = iceberg.get_decayed_confidence(
+            current_time, 
+            half_life_seconds=half_life_seconds
+        )
+        
+        # 2. Время без обновлений
+        time_since_update = (current_time - iceberg.last_update_time).total_seconds()
+        
+        # 3. Значимость для ML (threshold: 0.3)
+        is_significant = decayed_confidence > 0.3
+        
+        return {
+            'confidence': decayed_confidence,
+            'confidence_raw': iceberg.confidence_score,
+            'is_significant': is_significant,
+            'time_since_update_sec': time_since_update,
+            'refill_count': iceberg.refill_count,
+            'refill_frequency': iceberg.get_refill_frequency(),
+            'is_gamma_wall': iceberg.is_gamma_wall,
+            'spoofing_probability': iceberg.spoofing_probability
+        }
     
     # ========================================================================
     # TREND CALCULATION: Smart Money Context (Step 2)
@@ -405,51 +464,166 @@ class FeatureCollector:
         except:
             return None
     
-    def _get_whale_cvd(self) -> Optional[float]:
-        """CVD китов - читаем напрямую из book.whale_cvd"""
+    def _get_ofi(self) -> Optional[float]:
+        """
+        FIX (Gemini Validation): Читаем OFI напрямую из book.
+        
+        WHY: LocalOrderBook.calculate_ofi() уже вызывается в services.py при каждой сделке.
+        Просто берем актуальное значение, как с OBI и CVD.
+        
+        Returns:
+            float: Order Flow Imbalance
+            None: Если book недоступен
+        """
         if not self.order_book:
             return None
         try:
-            # WHY: LocalOrderBook хранит whale_cvd как словарь {'whale': float, 'dolphin': float, 'minnow': float}
-            if hasattr(self.order_book, 'whale_cvd') and isinstance(self.order_book.whale_cvd, dict):
-                return float(self.order_book.whale_cvd.get('whale', 0))
+            return self.order_book.calculate_ofi()
         except:
-            pass
-        return None
+            return None
+    
+    def _get_whale_cvd(self) -> Optional[float]:
+        """
+        FIX VULNERABILITY A: Возвращает ДЕЛЬТУ CVD китов с прошлого вызова.
+        
+        WHY: ML модели требуют stationary features (дельты), не абсолютные счетчики.
+        
+        Теория:
+        - Абсолют: whale_cvd(t) = whale_cvd(0) + Σsigned_volumes (random walk)
+        - Дельта: whale_cvd_delta(t) = current - last (осциллирует вокруг 0)
+        
+        Returns:
+            float: Изменение CVD с прошлого вызова (stationary)
+            0.0: Первый вызов (инициализация state)
+            None: order_book недоступен
+        """
+        if not self.order_book:
+            return None
+        
+        try:
+            # 1. Получаем текущий АБСОЛЮТ из order_book
+            if not (hasattr(self.order_book, 'whale_cvd') and isinstance(self.order_book.whale_cvd, dict)):
+                return None
+            
+            current_abs = float(self.order_book.whale_cvd.get('whale', 0))
+            
+            # 2. Первый вызов - инициализируем state
+            if self._last_whale_cvd == 0.0:
+                self._last_whale_cvd = current_abs
+                return 0.0  # Нет дельты на первом вызове
+            
+            # 3. Вычисляем дельту
+            delta = current_abs - self._last_whale_cvd
+            
+            # 4. Обновляем state
+            self._last_whale_cvd = current_abs
+            
+            # 5. Возвращаем дельту
+            return delta
+            
+        except Exception:
+            return None
     
     def _get_fish_cvd(self) -> Optional[float]:
-        """CVD рыб - читаем напрямую из book.whale_cvd['minnow']"""
+        """
+        FIX VULNERABILITY A: Возвращает ДЕЛЬТУ CVD рыб (minnow) с прошлого вызова.
+        
+        WHY: ML модели требуют stationary features (дельты), не абсолютные счетчики.
+        
+        Returns:
+            float: Изменение CVD с прошлого вызова (stationary)
+            0.0: Первый вызов (инициализация state)
+            None: order_book недоступен
+        """
         if not self.order_book:
             return None
+        
         try:
-            # WHY: В LocalOrderBook используется ключ 'minnow', а не 'fish'
-            if hasattr(self.order_book, 'whale_cvd') and isinstance(self.order_book.whale_cvd, dict):
-                return float(self.order_book.whale_cvd.get('minnow', 0))
-        except:
-            pass
-        return None
+            # 1. Получаем текущий АБСОЛЮТ из order_book (ключ 'minnow', а не 'fish')
+            if not (hasattr(self.order_book, 'whale_cvd') and isinstance(self.order_book.whale_cvd, dict)):
+                return None
+            
+            current_abs = float(self.order_book.whale_cvd.get('minnow', 0))
+            
+            # 2. Первый вызов - инициализируем state
+            if self._last_minnow_cvd == 0.0:
+                self._last_minnow_cvd = current_abs
+                return 0.0
+            
+            # 3. Вычисляем дельту
+            delta = current_abs - self._last_minnow_cvd
+            
+            # 4. Обновляем state
+            self._last_minnow_cvd = current_abs
+            
+            # 5. Возвращаем дельту
+            return delta
+            
+        except Exception:
+            return None
     
     def _get_dolphin_cvd(self) -> Optional[float]:
-        """CVD дельфинов - читаем напрямую из book.whale_cvd['dolphin']"""
+        """
+        FIX VULNERABILITY A: Возвращает ДЕЛЬТУ CVD дельфинов с прошлого вызова.
+        
+        WHY: ML модели требуют stationary features (дельты), не абсолютные счетчики.
+        
+        Returns:
+            float: Изменение CVD с прошлого вызова (stationary)
+            0.0: Первый вызов (инициализация state)
+            None: order_book недоступен
+        """
         if not self.order_book:
             return None
-        try:
-            if hasattr(self.order_book, 'whale_cvd') and isinstance(self.order_book.whale_cvd, dict):
-                return float(self.order_book.whale_cvd.get('dolphin', 0))
-        except:
-            pass
-        return None
-    
-    def _get_total_cvd(self) -> Optional[float]:
-        """Суммарный CVD"""
-        whale = self._get_whale_cvd()
-        fish = self._get_fish_cvd()
-        dolphin = self._get_dolphin_cvd()
         
+        try:
+            # 1. Получаем текущий АБСОЛЮТ из order_book
+            if not (hasattr(self.order_book, 'whale_cvd') and isinstance(self.order_book.whale_cvd, dict)):
+                return None
+            
+            current_abs = float(self.order_book.whale_cvd.get('dolphin', 0))
+            
+            # 2. Первый вызов - инициализируем state
+            if self._last_dolphin_cvd == 0.0:
+                self._last_dolphin_cvd = current_abs
+                return 0.0
+            
+            # 3. Вычисляем дельту
+            delta = current_abs - self._last_dolphin_cvd
+            
+            # 4. Обновляем state
+            self._last_dolphin_cvd = current_abs
+            
+            # 5. Возвращаем дельту
+            return delta
+            
+        except Exception:
+            return None
+    
+    def _calculate_total_cvd(
+        self,
+        whale: Optional[float],
+        fish: Optional[float],
+        dolphin: Optional[float]
+    ) -> Optional[float]:
+        """
+        WHY: Вычисляет total CVD из уже полученных значений.
+        
+        НЕ вызывает _get_*_cvd() повторно, чтобы избежать двойного обновления state.
+        
+        Args:
+            whale: Delta whale CVD
+            fish: Delta fish CVD  
+            dolphin: Delta dolphin CVD
+        
+        Returns:
+            Сумма всех CVD или None если все None
+        """
         if whale is None and fish is None and dolphin is None:
             return None
         
         return (whale or 0) + (fish or 0) + (dolphin or 0)
+    
     
     def _get_whale_cvd_delta(self, minutes: int) -> Optional[float]:
         """Изменение whale CVD за N минут"""

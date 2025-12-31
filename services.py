@@ -92,6 +92,10 @@ class TradingEngine:
         # === FIX: Time-based accumulation check (Gemini Validation) ===
         # WHY: Iteration-based проверка нестабильна из-за Adaptive Delay
         self.last_accumulation_check_time = 0.0  # Timestamp последней проверки
+        
+        # === FIX VULNERABILITY A: DB write throttling ===
+        # WHY: Throttling перенесён из FeatureCollector в services layer
+        self.last_db_write_time = 0.0  # Timestamp последней записи в DB
 
     async def run(self):
         """
@@ -424,40 +428,47 @@ class TradingEngine:
                                         
                                         # === НОВОЕ: ML Feature Collection (ШАГ 5.2) ===
                                         # WHY: Сохраняем снимок метрик при обнаружении айсберга
-                                        if self.repository and lvl:
-                                            # 1. Собираем snapshot метрик
-                                            snapshot = await self.feature_collector.capture_snapshot()
+                                        if lvl:
+                                            # 1. ВСЕГДА собираем snapshot (обновляет CVD state!)
+                                            snapshot = self.feature_collector.capture_snapshot()
                                             
-                                            # 2. Классифицируем намерение (SCALPER/INTRADAY/POSITIONAL)
-                                            # TODO: Replace estimated_adv with actual ADV from historical_memory
-                                            # WHY: Используем fallback оценку пока нет точных данных
-                                            estimated_adv = Decimal("10000")  # ~10k BTC average for BTCUSDT
-                                            intention_type = self.iceberg_analyzer.classify_intention(
-                                                hidden_volume=lvl.total_hidden_volume,
-                                                adv_20d=estimated_adv
-                                            )
+                                            # 2. THROTTLE ТОЛЬКО DB writes (100ms)
+                                            import time
+                                            current_time = time.time()
+                                            time_since_last_write = current_time - self.last_db_write_time
                                             
-                                            # 3. Вычисляем IIR (Iceberg Impact Ratio)
-                                            iir_value = float(lvl.total_hidden_volume / estimated_adv) if estimated_adv > 0 else 0.0
-                                            
-                                            # 4. Создаем lifecycle event с классификацией
-                                            lifecycle_id = await self.repository.save_lifecycle_event(
-                                                symbol=self.symbol,
-                                                price=trade.price,
-                                                is_ask=lvl.is_ask,
-                                                event_type='REFILLED',  # Или 'DETECTED' для первого обнаружения
-                                                total_volume_absorbed=lvl.total_hidden_volume,
-                                                refill_count=lvl.refill_count,
-                                                intention_type=intention_type,  # NEW: Smart Money classification
-                                                iir_value=iir_value              # NEW: Impact ratio
-                                            )
-                                            
-                                            # 3. Сохраняем feature snapshot
-                                            if lifecycle_id:
-                                                await self.repository.save_feature_snapshot(lifecycle_id, snapshot)
-                                            
-                                            # 4. Сохраняем уровень (старая логика)
-                                            asyncio.create_task(self.repository.save_level(lvl, self.symbol))
+                                            if self.repository and time_since_last_write >= 0.1:  # 100ms throttle
+                                                self.last_db_write_time = current_time
+                                                
+                                                # 3. Классифицируем намерение (SCALPER/INTRADAY/POSITIONAL)
+                                                # TODO: Replace estimated_adv with actual ADV from historical_memory
+                                                estimated_adv = Decimal("10000")  # ~10k BTC average for BTCUSDT
+                                                intention_type = self.iceberg_analyzer.classify_intention(
+                                                    hidden_volume=lvl.total_hidden_volume,
+                                                    adv_20d=estimated_adv
+                                                )
+                                                
+                                                # 4. Вычисляем IIR (Iceberg Impact Ratio)
+                                                iir_value = float(lvl.total_hidden_volume / estimated_adv) if estimated_adv > 0 else 0.0
+                                                
+                                                # 5. Создаем lifecycle event с классификацией
+                                                lifecycle_id = await self.repository.save_lifecycle_event(
+                                                    symbol=self.symbol,
+                                                    price=trade.price,
+                                                    is_ask=lvl.is_ask,
+                                                    event_type='REFILLED',
+                                                    total_volume_absorbed=lvl.total_hidden_volume,
+                                                    refill_count=lvl.refill_count,
+                                                    intention_type=intention_type,
+                                                    iir_value=iir_value
+                                                )
+                                                
+                                                # 6. Сохраняем feature snapshot
+                                                if lifecycle_id:
+                                                    await self.repository.save_feature_snapshot(lifecycle_id, snapshot)
+                                                
+                                                # 7. Сохраняем уровень
+                                                asyncio.create_task(self.repository.save_level(lvl, self.symbol))
                                     
                                     self.book.pending_refill_checks.remove(pending)
                             
@@ -1073,5 +1084,65 @@ class TradingEngine:
                     # Если данных нет (например, Rate Limit или ошибка сети)
                     pass
 
+            except asyncio.CancelledError:
+                print("🌊 GEX Monitor cancelled")
+                break
             except Exception as e:
                 print(f"❌ GEX Monitor Error: {e}")
+                # WHY: Gemini - При ошибке делаем паузу чтобы не спамить API
+                await asyncio.sleep(60)  # Пауза 60с перед retry
+                continue
+    
+    # ========================================================================
+    # GEMINI FIX: Periodic Cleanup (Fix: Zombie Icebergs)
+    # ========================================================================
+    
+    async def _periodic_cleanup_task(self):
+        """
+        WHY: Периодическая очистка зомби-айсбергов (каждую минуту).
+        
+        ПРОБЛЕМА (Gemini Validation):
+        - Айсберги без обновлений накапливались в памяти
+        - ML features загрязнялись устаревшими данными
+        - Память росла без ограничений
+        
+        РЕШЕНИЕ:
+        - Вызывает book.cleanup_old_icebergs() каждые 60 секунд
+        - Threshold: min_confidence=0.1 (10%)
+        - Half-life: 300 секунд (5 минут для swing)
+        
+        Логика:
+        - Айсберги без обновлений >10 минут → confidence < 0.1 → удаляются
+        - Свежие айсберги (<5 минут) → остаются
+        """
+        print("🧹 Periodic Cleanup Task started...")
+        
+        # WHY: First iteration delay = 60 (начинаем через минуту после старта)
+        await asyncio.sleep(60)
+        
+        while True:
+            try:
+                from datetime import datetime
+                
+                # Вызываем cleanup
+                removed_count = self.book.cleanup_old_icebergs(
+                    current_time=datetime.now(),
+                    half_life_seconds=300,  # 5 минут для swing trading
+                    min_confidence=0.1      # Удаляем айсберги с confidence <10%
+                )
+                
+                # Логируем только если что-то удалено
+                if removed_count > 0:
+                    print(f"🧹 Cleaned up {removed_count} zombie iceberg(s)")
+                
+                # Повторяем каждые 60 секунд
+                await asyncio.sleep(60)
+                
+            except asyncio.CancelledError:
+                print("🧹 Cleanup Task cancelled")
+                break
+            except Exception as e:
+                print(f"❌ Cleanup Task Error: {e}")
+                # Продолжаем работу даже при ошибках
+                await asyncio.sleep(60)
+                continue

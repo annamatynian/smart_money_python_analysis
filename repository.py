@@ -515,8 +515,8 @@ class PostgresRepository:
                         options_skew=float(r['options_skew']) if r['options_skew'] else None,
                         oi_delta=float(r['oi_delta']) if r['oi_delta'] else None,
                         
-                        ofi=float(r['ofi'] or 0),
-                        weighted_obi=float(r['weighted_obi'] or 0)
+                        book_ofi=float(r['ofi'] or 0),
+                        book_obi=float(r['weighted_obi'] or 0)
                     )
                     smart_candles.append(candle)
         except Exception as e:
@@ -708,7 +708,7 @@ class PostgresRepository:
             print(f"❌ Update lifecycle outcome error: {e}")
             return False
     
-    async def get_aggregated_smart_candles(
+    async def get_cold_start_candles(
         self,
         symbol: str,
         timeframe: str,
@@ -716,6 +716,10 @@ class PostgresRepository:
     ) -> List[SmartCandle]:
         """
         WHY: Загружает SmartCandles для cold start (ЗАДАЧА 3).
+        
+        ОТЛИЧИЕ ОТ get_aggregated_smart_candles():
+        - Этот метод: для холодного старта (symbol, timeframe, limit)
+        - get_aggregated_smart_candles(): для RAG (start_time, end_time)
         
         SQL-агрегация market_metrics_full в SmartCandles.
         Используется HistoricalMemory для заполнения истории.
@@ -755,9 +759,9 @@ class PostgresRepository:
                 AVG(book_ofi) AS avg_ofi,
                 AVG(book_obi) AS avg_obi,
                 AVG(spread_bps) AS avg_spread_bps,
-                -- WHY: CVD должен быть кумулятивным (пока просто берём last)
-                LAST(flow_whale_cvd_delta, time) AS whale_cvd,
-                LAST(flow_minnow_cvd_delta, time) AS minnow_cvd
+                -- WHY: CVD кумулятивный - суммируем дельты за период свечи
+                SUM(flow_whale_cvd_delta) AS whale_cvd,
+                SUM(flow_minnow_cvd_delta) AS minnow_cvd
             FROM market_metrics_full
             WHERE symbol = $2
             GROUP BY candle_time
@@ -778,8 +782,8 @@ class PostgresRepository:
                         close=Decimal(str(row['close'])),
                         whale_cvd=float(row['whale_cvd']) if row['whale_cvd'] else 0.0,
                         minnow_cvd=float(row['minnow_cvd']) if row['minnow_cvd'] else 0.0,
-                        ofi=float(row['avg_ofi']) if row['avg_ofi'] else 0.0,
-                        obi=float(row['avg_obi']) if row['avg_obi'] else 0.0
+                        book_ofi=float(row['avg_ofi']) if row['avg_ofi'] else 0.0,
+                        book_obi=float(row['avg_obi']) if row['avg_obi'] else 0.0
                     )
                     candles.append(candle)
                 
@@ -894,8 +898,8 @@ class PostgresRepository:
                         oi_delta=float(row['oi_delta']) if row['oi_delta'] else None,
                         
                         # Microstructure
-                        ofi=float(row['avg_ofi'] or 0),
-                        weighted_obi=float(row['avg_obi'] or 0),
+                        book_ofi=float(row['avg_ofi'] or 0),
+                        book_obi=float(row['avg_obi'] or 0),
                         
                         # Gamma
                         total_gex=float(row['total_gex']) if row['total_gex'] else None,
