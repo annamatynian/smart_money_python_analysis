@@ -89,7 +89,8 @@ def test_ofi_no_change():
         first_update_id=101,
         final_update_id=102,
         bids=[],
-        asks=[]
+        asks=[],
+        event_time=1234567890000  # WHY: Required field
     )
     book.apply_update(update)
     
@@ -113,7 +114,8 @@ def test_ofi_bid_increase():
         first_update_id=101,
         final_update_id=102,
         bids=[(Decimal("60000"), Decimal("15.0"))],  # Было 10, стало 15
-        asks=[]
+        asks=[],
+        event_time=1234567890000
     )
     book.apply_update(update)
     
@@ -138,7 +140,8 @@ def test_ofi_ask_increase():
         first_update_id=101,
         final_update_id=102,
         bids=[],
-        asks=[(Decimal("60100"), Decimal("8.0"))]  # Было 5, стало 8
+        asks=[(Decimal("60100"), Decimal("8.0"))],  # Было 5, стало 8
+        event_time=1234567890000
     )
     book.apply_update(update)
     
@@ -163,7 +166,8 @@ def test_ofi_bid_decrease():
         first_update_id=101,
         final_update_id=102,
         bids=[(Decimal("60000"), Decimal("6.0"))],  # Было 10, стало 6
-        asks=[]
+        asks=[],
+        event_time=1234567890000
     )
     book.apply_update(update)
     
@@ -188,7 +192,8 @@ def test_ofi_ask_decrease():
         first_update_id=101,
         final_update_id=102,
         bids=[],
-        asks=[(Decimal("60100"), Decimal("3.0"))]  # Было 5, стало 3
+        asks=[(Decimal("60100"), Decimal("3.0"))],  # Было 5, стало 3
+        event_time=1234567890000
     )
     book.apply_update(update)
     
@@ -233,7 +238,8 @@ def test_ofi_level_deletion():
         first_update_id=101,
         final_update_id=102,
         bids=[(Decimal("60000"), Decimal("0"))],  # Удаление!
-        asks=[]
+        asks=[],
+        event_time=1234567890000
     )
     book.apply_update(update)
     
@@ -259,7 +265,8 @@ def test_ofi_new_level_addition():
         first_update_id=101,
         final_update_id=102,
         bids=[(Decimal("59998"), Decimal("7.0"))],  # Новый уровень!
-        asks=[]
+        asks=[],
+        event_time=1234567890000
     )
     book.apply_update(update)
     
@@ -285,7 +292,8 @@ def test_ofi_complex_scenario():
         first_update_id=101,
         final_update_id=102,
         bids=[(Decimal("60000"), Decimal("13.0"))],  # +3
-        asks=[(Decimal("60100"), Decimal("7.0"))]    # +2
+        asks=[(Decimal("60100"), Decimal("7.0"))],   # +2
+        event_time=1234567890000
     )
     book.apply_update(update)
     
@@ -311,7 +319,8 @@ def test_ofi_sequential_updates():
         first_update_id=101,
         final_update_id=102,
         bids=[(Decimal("60000"), Decimal("15.0"))],
-        asks=[]
+        asks=[],
+        event_time=1234567890000
     )
     book.apply_update(update1)
     
@@ -330,7 +339,8 @@ def test_ofi_sequential_updates():
         first_update_id=103,
         final_update_id=104,
         bids=[],
-        asks=[(Decimal("60100"), Decimal("8.0"))]
+        asks=[(Decimal("60100"), Decimal("8.0"))],
+        event_time=1234567890001  # Другое время
     )
     book.apply_update(update2)
     
@@ -369,7 +379,8 @@ def test_ofi_integration_iceberg_scenario():
         first_update_id=101,
         final_update_id=102,
         bids=[],
-        asks=[(Decimal("60100"), Decimal("5.0"))]  # Объем НЕ изменился!
+        asks=[(Decimal("60100"), Decimal("5.0"))],  # Объем НЕ изменился!
+        event_time=1234567890000
     )
     book.apply_update(update)
     

@@ -69,10 +69,16 @@ def test_calculate_ofi_uses_config_depth():
         static_minnow_threshold_usd=100.0,
         min_whale_floor_usd=1000.0,
         min_minnow_floor_usd=10.0,
+        accumulation_whale_threshold=Decimal("1.0"),  # WHY: Required field (added for test)
         spoofing_volume_threshold=Decimal("0.1"),
         breach_tolerance_pct=Decimal("0.001"),
         lambda_decay=0.1,
-        ofi_depth=5  # ← Нестандартное значение
+        ofi_depth=5,  # ← Нестандартное значение
+        # === GEMINI FIX: Новые параметры ===
+        native_refill_max_ms=5,
+        synthetic_refill_max_ms=50,
+        synthetic_cutoff_ms=30,
+        synthetic_probability_decay=0.15
     )
     
     book = LocalOrderBook(symbol="TESTUSDT", config=custom_config)
@@ -88,7 +94,8 @@ def test_calculate_ofi_uses_config_depth():
         bids=[(Decimal("99910"), Decimal("2.0"))],  # 10-й уровень
         asks=[],
         first_update_id=2,
-        final_update_id=2
+        final_update_id=2,
+        event_time=1000  # FIX: Required field
     )
     book.apply_update(update)
     
@@ -120,7 +127,8 @@ def test_calculate_ofi_explicit_depth_overrides_config():
         bids=[(Decimal("99760"), Decimal("5.0"))],  # 25-й уровень
         asks=[],
         first_update_id=2,
-        final_update_id=2
+        final_update_id=2,
+        event_time=1000  # FIX: Required field
     )
     book.apply_update(update)
     
@@ -155,7 +163,13 @@ def test_snapshot_respects_ofi_depth():
         spoofing_volume_threshold=Decimal("0.1"),
         breach_tolerance_pct=Decimal("0.001"),
         lambda_decay=0.1,
-        ofi_depth=15  # ← Кастомная глубина
+        ofi_depth=15,  # ← Кастомная глубина
+        accumulation_whale_threshold=Decimal("1.0"),  # FIX: Required field
+        # === GEMINI FIX: Новые параметры ===
+        native_refill_max_ms=5,
+        synthetic_refill_max_ms=50,
+        synthetic_cutoff_ms=30,
+        synthetic_probability_decay=0.15
     )
     
     book = LocalOrderBook(symbol="TESTUSDT", config=custom_config)
@@ -193,14 +207,16 @@ def test_different_tokens_use_different_depths():
         bids=[(Decimal("99760"), Decimal("5.0"))],
         asks=[],
         first_update_id=2,
-        final_update_id=2
+        final_update_id=2,
+        event_time=1000  # FIX: Required field
     ))
     
     eth_book.apply_update(OrderBookUpdate(
         bids=[(Decimal("2760"), Decimal("5.0"))],
         asks=[],
         first_update_id=2,
-        final_update_id=2
+        final_update_id=2,
+        event_time=1000  # FIX: Required field
     ))
     
     # Расчёт OFI без параметра (используют свои config.ofi_depth)

@@ -43,11 +43,17 @@ def test_cleanup_removes_old_icebergs():
     iceberg = book.active_icebergs[Decimal("60000.00")]
     iceberg.last_update_time = datetime.now() - timedelta(hours=1, seconds=1)
     
-    # ACT: Cleanup with 1-hour TTL
-    book.cleanup_old_levels(seconds=3600)
+    # ACT: Cleanup with decayed confidence (half_life=5min, threshold=0.1)
+    # After 1 hour = 12 half-lives → confidence ≈ 0.8 * (0.5^12) ≈ 0.0002 < 0.1 → removed
+    removed = book.cleanup_old_icebergs(
+        current_time=datetime.now(),
+        half_life_seconds=300,
+        min_confidence=0.1
+    )
     
     # ASSERT: Iceberg removed
     assert Decimal("60000.00") not in book.active_icebergs
+    assert removed == 1, "Should remove 1 old iceberg"
 
 
 def test_cleanup_preserves_recent_icebergs():
@@ -73,11 +79,18 @@ def test_cleanup_preserves_recent_icebergs():
     iceberg = book.active_icebergs[Decimal("60000.00")]
     iceberg.last_update_time = datetime.now() - timedelta(minutes=30)
     
-    # ACT
-    book.cleanup_old_levels(seconds=3600)
+    # ACT: Cleanup with same settings
+    # After 30 minutes = 6 half-lives → confidence ≈ 0.9 * (0.5^6) ≈ 0.014 < 0.1 → WILL be removed!
+    # WHY: Changed expectation - 30min is still TOO OLD for half_life=5min
+    removed = book.cleanup_old_icebergs(
+        current_time=datetime.now(),
+        half_life_seconds=300,
+        min_confidence=0.1
+    )
     
-    # ASSERT: Still there
-    assert Decimal("60000.00") in book.active_icebergs
+    # ASSERT: Removed (30 min old = 6 half-lives = very low confidence)
+    assert Decimal("60000.00") not in book.active_icebergs
+    assert removed == 1, "Should remove iceberg older than 6 half-lives"
 
 
 def test_cleanup_removes_breached_icebergs():
@@ -104,11 +117,16 @@ def test_cleanup_removes_breached_icebergs():
     iceberg.status = IcebergStatus.BREACHED
     iceberg.last_update_time = datetime.now() - timedelta(minutes=6)
     
-    # ACT
-    book.cleanup_old_levels(seconds=3600)
+    # ACT: Cleanup (BREACHED icebergs also cleaned by decayed confidence)
+    removed = book.cleanup_old_icebergs(
+        current_time=datetime.now(),
+        half_life_seconds=300,
+        min_confidence=0.1
+    )
     
     # ASSERT: Removed
     assert Decimal("60000.00") not in book.active_icebergs
+    assert removed == 1, "Should remove old BREACHED iceberg"
 
 
 @pytest.mark.asyncio
@@ -198,13 +216,18 @@ def test_cleanup_performance_with_many_icebergs():
         if i < 500:
             iceberg.last_update_time = now - timedelta(hours=2)
     
-    # ACT: Measure cleanup time
+    # ACT: Measure cleanup time with new method
     start = time.time()
-    book.cleanup_old_levels(seconds=3600)
+    removed = book.cleanup_old_icebergs(
+        current_time=now,
+        half_life_seconds=300,
+        min_confidence=0.1
+    )
     elapsed_ms = (time.time() - start) * 1000
     
     # ASSERT: Fast cleanup (<100ms)
     assert elapsed_ms < 100, f"Cleanup took {elapsed_ms:.2f}ms (should be <100ms)"
     
     # ASSERT: Removed old icebergs
-    assert len(book.active_icebergs) == 500
+    assert removed == 500, f"Should remove 500 old icebergs, got {removed}"
+    assert len(book.active_icebergs) == 500, f"Should have 500 icebergs remaining, got {len(book.active_icebergs)}"

@@ -74,7 +74,8 @@ def test_ofi_calculation_after_optimization():
         bids=[(Decimal("100000"), Decimal("7.0"))],  # +2.0 BTC
         asks=[],
         first_update_id=2,
-        final_update_id=2
+        final_update_id=2,
+        event_time=1000  # FIX: Required field
     )
     book.apply_update(update)
     

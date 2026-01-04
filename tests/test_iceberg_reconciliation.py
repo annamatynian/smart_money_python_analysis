@@ -173,7 +173,8 @@ def test_reconcile_only_affects_icebergs_not_orderbook():
         bids=[(Decimal("60000.00"), Decimal("10.0"))],
         asks=[(Decimal("60100.00"), Decimal("5.0"))],
         first_update_id=100,
-        final_update_id=100
+        final_update_id=100,
+        event_time=1000  # FIX: Required field
     )
     book.apply_update(update)
     

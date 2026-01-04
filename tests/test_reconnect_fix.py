@@ -34,7 +34,8 @@ def test_apply_snapshot_resets_ofi_state():
         bids=[(Decimal("100000"), Decimal("2.0"))],  # Увеличили bid
         asks=[],
         first_update_id=101,
-        final_update_id=101
+        final_update_id=101,
+        event_time=1000  # FIX: Required field
     )
     book.apply_update(update)
     
@@ -94,7 +95,8 @@ def test_ofi_after_reconnect_is_not_giant():
         bids=[(Decimal("99000"), Decimal("5.5"))],  # +0.5 BTC
         asks=[],
         first_update_id=201,
-        final_update_id=201
+        final_update_id=201,
+        event_time=1000  # FIX: Required field
     )
     book.apply_update(update)
     
@@ -133,7 +135,8 @@ def test_multiple_reconnects():
             bids=[(base_price, Decimal("1.5"))],
             asks=[],
             first_update_id=100 * (i + 1) + 1,
-            final_update_id=100 * (i + 1) + 1
+            final_update_id=100 * (i + 1) + 1,
+            event_time=1000 + i*100  # FIX: Required field
         )
         book.apply_update(update)
         

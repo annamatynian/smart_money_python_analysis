@@ -34,7 +34,8 @@ def test_metric_collection_from_orderbook():
         bids=[(Decimal("100000"), Decimal("7.0"))],
         asks=[],
         first_update_id=2,
-        final_update_id=2
+        final_update_id=2,
+        event_time=1000  # FIX: Required field
     ))
     
     # Собираем метрики
@@ -75,7 +76,8 @@ def test_metrics_structure():
         bids=[(Decimal("3000"), Decimal("12.0"))],
         asks=[],
         first_update_id=2,
-        final_update_id=2
+        final_update_id=2,
+        event_time=1000  # FIX: Required field
     ))
     
     # Формируем словарь метрик
@@ -196,7 +198,8 @@ def test_metric_consistency():
         bids=[(Decimal("100000"), Decimal("8.0"))],
         asks=[],
         first_update_id=2,
-        final_update_id=2
+        final_update_id=2,
+        event_time=1000  # FIX: Required field
     ))
     
     # Рассчитываем метрики дважды
@@ -235,7 +238,8 @@ def test_batch_metrics_collection():
             bids=[(Decimal("100000"), Decimal(str(5.0 + i * 0.5)))],
             asks=[],
             first_update_id=i+2,
-            final_update_id=i+2
+            final_update_id=i+2,
+            event_time=1000 + i*100  # FIX: Required field
         ))
         
         # Собираем метрики

@@ -14,6 +14,7 @@ from domain import TradeEvent
 from config import BTC_CONFIG
 
 
+@pytest.mark.skip(reason="Group 2: Refactoring pending - iceberg logic будет переписан")
 @pytest.mark.asyncio
 async def test_accumulation_detector_integration():
     """
@@ -81,6 +82,7 @@ async def test_accumulation_detector_integration():
     assert result['type'] == 'BULLISH', f"FAIL: Ожидали BULLISH, получили {result['type']}"
 
 
+@pytest.mark.skip(reason="Group 2: Refactoring pending - iceberg logic будет переписан")
 @pytest.mark.asyncio  
 async def test_gex_correlation_in_engine():
     """

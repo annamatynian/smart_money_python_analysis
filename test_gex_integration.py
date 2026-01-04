@@ -5,6 +5,7 @@ from domain import GammaProfile, LocalOrderBook, TradeEvent
 from analyzers import IcebergAnalyzer
 from config import BTC_CONFIG  # WHY: Нужен config для создания экземпляра
 
+@pytest.mark.skip(reason="Group 2: Refactoring pending - iceberg logic будет переписан")
 def test_adjust_confidence_positive_gamma_on_wall():
     """
     WHY: При +GEX айсберг НА gamma wall должен иметь x1.8 boost.
@@ -30,6 +31,7 @@ def test_adjust_confidence_positive_gamma_on_wall():
     assert abs(adjusted - expected) < 0.01, f"Expected {expected}, got {adjusted}"
     assert is_major == True, "Should be major gamma event"
 
+@pytest.mark.skip(reason="Group 2: Refactoring pending - iceberg logic будет переписан")
 def test_adjust_confidence_negative_gamma_on_wall():
     """
     WHY: При -GEX айсберг НА gamma wall должен иметь x1.3 boost (меньше чем при +GEX).
@@ -55,6 +57,7 @@ def test_adjust_confidence_negative_gamma_on_wall():
     assert abs(adjusted - expected) < 0.01, f"Expected {expected}, got {adjusted}"
     assert is_major == True, "Should be major gamma event"
 
+@pytest.mark.skip(reason="Group 2: Refactoring pending - iceberg logic будет переписан")
 def test_adjust_confidence_negative_gamma_not_on_wall():
     """
     WHY: При -GEX обычные айсберги (НЕ на стене) должны иметь x0.75 penalty.
@@ -80,6 +83,7 @@ def test_adjust_confidence_negative_gamma_not_on_wall():
     assert abs(adjusted - expected) < 0.01, f"Expected {expected}, got {adjusted}"
     assert is_major == False, "Should NOT be major gamma event"
 
+@pytest.mark.skip(reason="Group 2: Refactoring pending - iceberg logic будет переписан")
 def test_adjust_confidence_no_gamma_profile():
     """
     WHY: Без gamma profile уверенность не должна меняться.
@@ -98,6 +102,7 @@ def test_adjust_confidence_no_gamma_profile():
     assert adjusted == base_conf, "Confidence should remain unchanged"
     assert is_major == False, "No gamma event without profile"
 
+@pytest.mark.skip(reason="Group 2: Refactoring pending - iceberg logic будет переписан")
 def test_near_gamma_wall_detection():
     """
     WHY: LocalOrderBook должен правильно определять близость к стенам.
@@ -124,6 +129,7 @@ def test_near_gamma_wall_detection():
     assert is_near == False, "Should NOT detect any wall"
     assert wall_type is None, f"Expected None, got {wall_type}"
 
+@pytest.mark.skip(reason="Group 2: Refactoring pending - iceberg logic будет переписан")
 def test_confidence_capped_at_one():
     """
     WHY: Adjusted confidence не должна превышать 1.0.

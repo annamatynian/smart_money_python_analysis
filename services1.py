@@ -1,36 +1,13 @@
 import asyncio
 from decimal import Decimal
-from enum import Enum, auto
 from domain import LocalOrderBook, TradeEvent, OrderBookUpdate, GapDetectedError
 from infrastructure import IMarketDataSource, ReorderingBuffer, LatencyMonitor
 from analyzers import IcebergAnalyzer, WhaleAnalyzer, AccumulationDetector, SpoofingAnalyzer, FlowToxicityAnalyzer, GammaProvider
 from analyzers_features import FeatureCollector  # WHY: Для ML feature collection
 from analyzers_derivatives import DerivativesAnalyzer  # WHY: Clean Architecture - математика derivatives
 from datetime import datetime
-import logging  # WHY: Для логирования warmup state
 # WHY: Импорт функции загрузки config для мульти-токен поддержки
 from config import get_config
-
-logger = logging.getLogger(__name__)
-
-
-class EngineState(Enum):
-    """
-    WHY: Конечный автомат для управления состоянием engine.
-    
-    Состояния:
-    - INITIALIZING: Старт, нет соединения
-    - WARMING_UP: Соединение есть, наполняем буфер, сигналы OFF
-    - RUNNING: Штатная работа, сигналы ON
-    - ERROR: Сбой
-    
-    Источник: "Critical Audit of Cryptocurrency HFT Iceberg Detection System",
-    Section: State Recovery - Warm-up Period Implementation
-    """
-    INITIALIZING = auto()  # Старт, нет соединения
-    WARMING_UP = auto()    # Соединение есть, наполняем буфер, сигналы OFF
-    RUNNING = auto()       # Штатная работа, сигналы ON
-    ERROR = auto()         # Сбой
 
 
 class Colors:
@@ -109,12 +86,6 @@ class TradingEngine:
         # Флаг инициализации
         self.is_initialized = False
         
-        # === WARM-UP PERIOD (State Recovery Protection) ===
-        # WHY: Конечный автомат для предотвращения Ghost Trades при reconnect
-        self.state = EngineState.INITIALIZING
-        self._warmup_end_time = 0.0  # asyncio.get_event_loop().time() timestamp окончания prewarm
-        self.config = config  # WHY: Сохраняем для доступа к warmup_period_ms
-        
         # === FUSION LOGIC: Price tracking for Absorption detection ===
         self._last_mid_price = None  # Используется для расчёта price_change
         
@@ -179,11 +150,6 @@ class TradingEngine:
             last_update_id=snapshot['lastUpdateId']
         )
         
-        # === Шаг 4.5: WARM-UP STATE ===
-        # WHY: После apply_snapshot переходим в WARMING_UP.
-        # Сигналы будут подавлены на warmup_period_ms мс.
-        self._set_warmup_state()
-        
         # Шаг 5: Применяем буферизованные updates (только актуальные)
         await self._apply_buffered_updates()
         
@@ -197,84 +163,6 @@ class TradingEngine:
         
         # Держим все задачи активными
         await asyncio.gather(*tasks_to_gather)
-
-    # === WARM-UP PERIOD METHODS ===
-    
-    def _set_warmup_state(self):
-        """
-        WHY: Переводит engine в состояние WARMING_UP.
-        
-        Вызывается:
-        - После применения snapshot (cold start)
-        - После reconnect (повторный snapshot)
-        
-        Логика:
-        1. state = WARMING_UP
-        2. _warmup_end_time = текущее_время + warmup_period_ms
-        3. Логируем сообщение
-        
-        Источник: "Critical Audit", Section: State Recovery - Warm-up Implementation
-        """
-        # Переключаем state
-        self.state = EngineState.WARMING_UP
-        
-        # Устанавливаем время окончания прогрева
-        current_time = asyncio.get_event_loop().time()
-        warmup_duration_sec = self.config.warmup_period_ms / 1000.0  # Конвертируем ms в секунды
-        self._warmup_end_time = current_time + warmup_duration_sec
-        
-        # === FIX: Zombie Icebergs (Gemini Critical Audit) ===
-        # WHY: При reconnect старые айсберги становятся "stale state".
-        # Очищаем их чтобы избежать торговли против "призраков".
-        # Источник: Gemini Audit - "Zombie Icebergs при реконнекте"
-        if hasattr(self.book, 'active_icebergs'):
-            iceberg_count = len(self.book.active_icebergs)
-            self.book.active_icebergs.clear()
-            if iceberg_count > 0:
-                logger.info(f"🧹 State reset: Cleared {iceberg_count} stale iceberg(s) due to reconnection.")
-                print(f"{Colors.YELLOW}🧹 Cleared {iceberg_count} stale iceberg(s){Colors.RESET}")
-        
-        # Логируем
-        logger.info(
-            f"🔄 System entering WARM-UP state for {self.config.warmup_period_ms}ms. "
-            f"Signals suppressed until {datetime.fromtimestamp(self._warmup_end_time).strftime('%H:%M:%S.%f')[:-3]}"
-        )
-        print(
-            f"{Colors.YELLOW}🔄 WARM-UP: {self.config.warmup_period_ms}ms "
-            f"(signals suppressed){Colors.RESET}"
-        )
-    
-    def is_warmup_active(self) -> bool:
-        """
-        WHY: Проверяет активен ли warm-up period.
-        
-        Используется в _consume_trades_and_depth() для подавления сигналов.
-        
-        Returns:
-            True - если прогрев активен (сигналы НЕ должны проходить)
-            False - если прогрев истек (сигналы МОГУТ проходить)
-        
-        Автоматически переключает state в RUNNING при истечении.
-        """
-        # Если не в WARMING_UP - warmup не активен
-        if self.state != EngineState.WARMING_UP:
-            return False
-        
-        # Проверяем истекло ли время
-        current_time = asyncio.get_event_loop().time()
-        
-        if current_time >= self._warmup_end_time:
-            # Warmup истек - переходим в RUNNING
-            self.state = EngineState.RUNNING
-            logger.info(
-                f"✅ WARM-UP period expired. Transitioning to RUNNING state. "
-                f"Signals now active."
-            )
-            print(f"{Colors.GREEN}✅ WARM-UP complete. Signals active.{Colors.RESET}")
-            return False
-        
-        # Warmup еще активен
-        return True
 
     async def _initialize_book(self):
         """
@@ -407,20 +295,16 @@ class TradingEngine:
             if current_time - self.last_accumulation_check_time > 30.0:
                 self.last_accumulation_check_time = current_time  # Reset timer
                 
-                # === FIX: Signal Leakage - Accumulation (Gemini Critical Audit) ===
-                # WHY: Блокируем сигналы Wyckoff во время warm-up.
-                # get_current_divergence_state() продолжает работать (state building).
-                if not self.is_warmup_active():
-                    try:
-                        accumulation_results = self.accumulation_detector.detect_accumulation_multi_timeframe()
-                        
-                        # Если обнаружена дивергенция на любом таймфрейме
-                        if accumulation_results:
-                            for timeframe, result in accumulation_results.items():
-                                self._print_accumulation_alert(timeframe, result)
-                    except Exception as e:
-                        # Не ломаем главный цикл при ошибках в детекции
-                        print(f"⚠️ Accumulation detection error: {e}")
+                try:
+                    accumulation_results = self.accumulation_detector.detect_accumulation_multi_timeframe()
+                    
+                    # Если обнаружена дивергенция на любом таймфрейме
+                    if accumulation_results:
+                        for timeframe, result in accumulation_results.items():
+                            self._print_accumulation_alert(timeframe, result)
+                except Exception as e:
+                    # Не ломаем главный цикл при ошибках в детекции
+                    print(f"⚠️ Accumulation detection error: {e}")
             
             # 1. Ждем с адаптивной задержкой (Micro-Batching)
             current_delay_sec = self.buffer.delay_sec
@@ -449,194 +333,184 @@ class TradingEngine:
                 continue
 
             # 5. Обрабатываем события строго по порядку времени
-            # === FIX VULNERABILITY #6: Error Boundary (Production Stability) ===
-            # WHY: Любое unhandled exception в обработке события крашило весь бот
-            # РЕШЕНИЕ: Wrap каждую итерацию в try-except, логируем + continue
             for event in sorted_events:
-                try:
-                    # --- ВАРИАНТ А: Обновление Стакана (OrderBookUpdate) ---
-                    if isinstance(event, OrderBookUpdate):
-                        update = event
-                        try:
-                            if self.book.apply_update(update):
-                                # === NEW: Delta-t Iceberg Detection ===
-                                update_time_ms = int(update.event_time.timestamp() * 1000)
+                
+                # --- ВАРИАНТ А: Обновление Стакана (OrderBookUpdate) ---
+                if isinstance(event, OrderBookUpdate):
+                    update = event
+                    try:
+                        if self.book.apply_update(update):
                             
-                                for pending in list(self.book.pending_refill_checks):
-                                    trade = pending['trade']
-                                
-                                    if pending['price'] != trade.price:
-                                        continue
-                                
-                                    delta_t = update_time_ms - pending['trade_time_ms']
-                                
-                                    if delta_t < 0:  # Race condition - reject negative
-                                        continue
-                                
-                                    if delta_t > 100:
-                                        self.book.pending_refill_checks.remove(pending)
-                                        continue
-                                
-                                    current_vol = self._get_volume_at_price(trade.price, pending['is_ask'])
-                                
-                                    if current_vol >= pending['visible_before']:
-                                    
-                                        # === GEMINI FIX: Извлекаем VPIN и CVD Divergence (Data Fusion) ===
-                                        stored_vpin = pending.get('vpin_score')
-                                        stored_divergence = pending.get('cvd_divergence')
-                                    
-                                        iceberg_event = self.iceberg_analyzer.analyze_with_timing(
-                                            book=self.book,
-                                            trade=trade,
-                                            visible_before=pending['visible_before'],
-                                            delta_t_ms=delta_t,
-                                            update_time_ms=update_time_ms,
-                                            vpin_score=stored_vpin,        # ✅ GEMINI: Pass VPIN
-                                            cvd_divergence=stored_divergence # ✅ GEMINI: Pass CVD
-                                        )
-                                    
-                                        if iceberg_event:
-                                            # === WARM-UP PERIOD: Signal Suppression ===
-                                            # WHY: Во время warm-up анализатор РАБОТАЕТ (state building),
-                                            # но сигналы НЕ проходят (signal suppression).
-                                            # Это предотвращает Ghost Trades при reconnect.
-                                            # Источник: "Critical Audit", Section: State Recovery
-                                            if self.is_warmup_active():
-                                                continue  # Пропускаем всю обработку айсберга
-                                            
-                                            lvl = self.book.active_icebergs.get(trade.price)
-                                            total_hidden = lvl.total_hidden_volume if lvl else iceberg_event.detected_hidden_volume
-                                            obi = self.book.get_weighted_obi(depth=20)
-                                        
-                                            # === НОВОЕ: Anti-Spoofing Integration ===
-                                            # WHY: Рассчитываем вероятность спуфинга для корректировки confidence
-                                            if lvl:
-                                                # Получаем текущую mid_price и историю
-                                                current_mid = self.book.get_mid_price()
-                                                price_history = list(self.book.historical_memory.history['1h']['price'])
-                                            
-                                                # Рассчитываем spoofing probability
-                                                spoofing_prob = self.spoofing_analyzer.calculate_spoofing_probability(
-                                                    iceberg_level=lvl,
-                                                    current_mid_price=current_mid,
-                                                    price_history=price_history
-                                                )
-                                            
-                                                # Сохраняем в IcebergLevel
-                                                lvl.spoofing_probability = spoofing_prob
-                                            
-                                                # Корректируем confidence на основе spoofing
-                                                # WHY: Формула adjusted = base * (1 - spoofing_prob)
-                                                base_confidence = lvl.confidence_score
-                                                lvl.confidence_score = base_confidence * (1.0 - spoofing_prob)
-                                        
-                                            self._print_iceberg_update(iceberg_event, total_hidden, obi, lvl)
-                                        
-                                            # === НОВОЕ: Anti-Spoofing Integration ===
-                                            # WHY: Рассчитываем вероятность спуфинга и корректируем confidence
-                                            if lvl:
-                                                current_mid = self.book.get_mid_price()
-                                                price_history = self.book.historical_memory.get_price_history(limit=100)
-                                            
-                                                spoofing_prob = self.spoofing_analyzer.calculate_spoofing_probability(
-                                                    iceberg_level=lvl,
-                                                    current_mid_price=current_mid,
-                                                    price_history=price_history
-                                                )
-                                            
-                                                # Обновляем поле в айсберге
-                                                lvl.spoofing_probability = spoofing_prob
-                                            
-                                                # Корректируем confidence: adjusted = base * (1 - spoofing_prob)
-                                                if spoofing_prob > 0.5:  # Только если вероятность спуфинга высокая
-                                                    original_conf = lvl.confidence_score
-                                                    lvl.confidence_score = original_conf * (1.0 - spoofing_prob)
-                                                
-                                                    # Debug вывод для высокого spoofing
-                                                    if spoofing_prob > 0.7:
-                                                        print(f"   ⚠️  SPOOFING ALERT: {spoofing_prob*100:.0f}% probability (confidence adjusted {original_conf:.2f} → {lvl.confidence_score:.2f})")
-                                        
-                                            # === НОВОЕ: ML Feature Collection (ШАГ 5.2) ===
-                                            # WHY: Сохраняем снимок метрик при обнаружении айсберга
-                                            if lvl:
-                                                # FIX VULNERABILITY #2: Передаем exchange event_time (Time-Deterministic)
-                                                # WHY: update.event_time = биржевое время, устраняет clock skew и processing lag
-                                            
-                                                # Convert event_time (datetime or int ms) to datetime
-                                                if isinstance(update.event_time, datetime):
-                                                    exchange_time = update.event_time
-                                                else:
-                                                    # event_time is int milliseconds (from Pydantic model)
-                                                    from datetime import timezone
-                                                    exchange_time = datetime.fromtimestamp(
-                                                        update.event_time / 1000.0, 
-                                                        tz=timezone.utc
-                                                    )
-                                            
-                                                # FIX VULNERABILITY #2: Передаем ВСЕ параметры (Gemini validation)
-                                                snapshot = self.feature_collector.capture_snapshot(
-                                                    historical_memory=self.book.historical_memory,
-                                                    iceberg=lvl,
-                                                    event_time=exchange_time  # Exchange source of truth
-                                                )
-                                            
-                                                # === FIX VULNERABILITY #4: Skip DB writes during warm-up ===
-                                                # WHY: snapshot = None если cold start (первые 60 секунд)
-                                                if snapshot is None:
-                                                    continue  # Пропускаем DB write на cold start
-                                            
-                                                # 2. THROTTLE ТОЛЬКО DB writes (100ms)
-                                                import time
-                                                current_time = time.time()
-                                                time_since_last_write = current_time - self.last_db_write_time
-                                            
-                                                if self.repository and time_since_last_write >= 0.1:  # 100ms throttle
-                                                    self.last_db_write_time = current_time
-                                                
-                                                    # 3. Классифицируем намерение (SCALPER/INTRADAY/POSITIONAL)
-                                                    # TODO: Replace estimated_adv with actual ADV from historical_memory
-                                                    estimated_adv = Decimal("10000")  # ~10k BTC average for BTCUSDT
-                                                    intention_type = self.iceberg_analyzer.classify_intention(
-                                                        hidden_volume=lvl.total_hidden_volume,
-                                                        adv_20d=estimated_adv
-                                                    )
-                                                
-                                                    # 4. Вычисляем IIR (Iceberg Impact Ratio)
-                                                    iir_value = float(lvl.total_hidden_volume / estimated_adv) if estimated_adv > 0 else 0.0
-                                                
-                                                    # 5. Создаем lifecycle event с классификацией
-                                                    lifecycle_id = await self.repository.save_lifecycle_event(
-                                                        symbol=self.symbol,
-                                                        price=trade.price,
-                                                        is_ask=lvl.is_ask,
-                                                        event_type='REFILLED',
-                                                        total_volume_absorbed=lvl.total_hidden_volume,
-                                                        refill_count=lvl.refill_count,
-                                                        intention_type=intention_type,
-                                                        iir_value=iir_value
-                                                    )
-                                                
-                                                    # 6. Сохраняем feature snapshot
-                                                    if lifecycle_id:
-                                                        await self.repository.save_feature_snapshot(lifecycle_id, snapshot)
-                                                
-                                                    # 7. Сохраняем уровень
-                                                    asyncio.create_task(self.repository.save_level(lvl, self.symbol))
-                                    
-                                        self.book.pending_refill_checks.remove(pending)
+                            # === NEW: Delta-t Iceberg Detection ===
+                            update_time_ms = int(update.event_time.timestamp() * 1000)
                             
-                                if not self.book.validate_integrity():
-                                    print("❌ Book integrity failed! Resyncing...")
+                            for pending in list(self.book.pending_refill_checks):
+                                trade = pending['trade']
+                                
+                                if pending['price'] != trade.price:
+                                    continue
+                                
+                                delta_t = update_time_ms - pending['trade_time_ms']
+                                
+                                if delta_t < 0:  # Race condition - reject negative
+                                    continue
+                                
+                                if delta_t > 100:
+                                    self.book.pending_refill_checks.remove(pending)
+                                    continue
+                                
+                                current_vol = self._get_volume_at_price(trade.price, pending['is_ask'])
+                                
+                                if current_vol >= pending['visible_before']:
+                                    
+                                    # === GEMINI FIX: Извлекаем VPIN и CVD Divergence (Data Fusion) ===
+                                    stored_vpin = pending.get('vpin_score')
+                                    stored_divergence = pending.get('cvd_divergence')
+                                    
+                                    iceberg_event = self.iceberg_analyzer.analyze_with_timing(
+                                        book=self.book,
+                                        trade=trade,
+                                        visible_before=pending['visible_before'],
+                                        delta_t_ms=delta_t,
+                                        update_time_ms=update_time_ms,
+                                        vpin_score=stored_vpin,        # ✅ GEMINI: Pass VPIN
+                                        cvd_divergence=stored_divergence # ✅ GEMINI: Pass CVD
+                                    )
+                                    
+                                    if iceberg_event:
+                                        lvl = self.book.active_icebergs.get(trade.price)
+                                        total_hidden = lvl.total_hidden_volume if lvl else iceberg_event.detected_hidden_volume
+                                        obi = self.book.get_weighted_obi(depth=20)
+                                        
+                                        # === НОВОЕ: Anti-Spoofing Integration ===
+                                        # WHY: Рассчитываем вероятность спуфинга для корректировки confidence
+                                        if lvl:
+                                            # Получаем текущую mid_price и историю
+                                            current_mid = self.book.get_mid_price()
+                                            price_history = list(self.book.historical_memory.history['1h']['price'])
+                                            
+                                            # Рассчитываем spoofing probability
+                                            spoofing_prob = self.spoofing_analyzer.calculate_spoofing_probability(
+                                                iceberg_level=lvl,
+                                                current_mid_price=current_mid,
+                                                price_history=price_history
+                                            )
+                                            
+                                            # Сохраняем в IcebergLevel
+                                            lvl.spoofing_probability = spoofing_prob
+                                            
+                                            # Корректируем confidence на основе spoofing
+                                            # WHY: Формула adjusted = base * (1 - spoofing_prob)
+                                            base_confidence = lvl.confidence_score
+                                            lvl.confidence_score = base_confidence * (1.0 - spoofing_prob)
+                                        
+                                        self._print_iceberg_update(iceberg_event, total_hidden, obi, lvl)
+                                        
+                                        # === НОВОЕ: Anti-Spoofing Integration ===
+                                        # WHY: Рассчитываем вероятность спуфинга и корректируем confidence
+                                        if lvl:
+                                            current_mid = self.book.get_mid_price()
+                                            price_history = self.book.historical_memory.get_price_history(limit=100)
+                                            
+                                            spoofing_prob = self.spoofing_analyzer.calculate_spoofing_probability(
+                                                iceberg_level=lvl,
+                                                current_mid_price=current_mid,
+                                                price_history=price_history
+                                            )
+                                            
+                                            # Обновляем поле в айсберге
+                                            lvl.spoofing_probability = spoofing_prob
+                                            
+                                            # Корректируем confidence: adjusted = base * (1 - spoofing_prob)
+                                            if spoofing_prob > 0.5:  # Только если вероятность спуфинга высокая
+                                                original_conf = lvl.confidence_score
+                                                lvl.confidence_score = original_conf * (1.0 - spoofing_prob)
+                                                
+                                                # Debug вывод для высокого spoofing
+                                                if spoofing_prob > 0.7:
+                                                    print(f"   ⚠️  SPOOFING ALERT: {spoofing_prob*100:.0f}% probability (confidence adjusted {original_conf:.2f} → {lvl.confidence_score:.2f})")
+                                        
+                                        # === НОВОЕ: ML Feature Collection (ШАГ 5.2) ===
+                                        # WHY: Сохраняем снимок метрик при обнаружении айсберга
+                                        if lvl:
+                                            # FIX VULNERABILITY #2: Передаем exchange event_time (Time-Deterministic)
+                                            # WHY: update.event_time = биржевое время, устраняет clock skew и processing lag
+                                            
+                                            # Convert event_time (datetime or int ms) to datetime
+                                            if isinstance(update.event_time, datetime):
+                                                exchange_time = update.event_time
+                                            else:
+                                                # event_time is int milliseconds (from Pydantic model)
+                                                from datetime import timezone
+                                                exchange_time = datetime.fromtimestamp(
+                                                    update.event_time / 1000.0, 
+                                                    tz=timezone.utc
+                                                )
+                                            
+                                            # FIX VULNERABILITY #2: Передаем ВСЕ параметры (Gemini validation)
+                                            snapshot = self.feature_collector.capture_snapshot(
+                                                historical_memory=self.book.historical_memory,
+                                                iceberg=lvl,
+                                                event_time=exchange_time  # Exchange source of truth
+                                            )
+                                            
+                                            # === FIX VULNERABILITY #4: Skip DB writes during warm-up ===
+                                            # WHY: snapshot = None если cold start (первые 60 секунд)
+                                            if snapshot is None:
+                                                continue  # Пропускаем DB write на cold start
+                                            
+                                            # 2. THROTTLE ТОЛЬКО DB writes (100ms)
+                                            import time
+                                            current_time = time.time()
+                                            time_since_last_write = current_time - self.last_db_write_time
+                                            
+                                            if self.repository and time_since_last_write >= 0.1:  # 100ms throttle
+                                                self.last_db_write_time = current_time
+                                                
+                                                # 3. Классифицируем намерение (SCALPER/INTRADAY/POSITIONAL)
+                                                # TODO: Replace estimated_adv with actual ADV from historical_memory
+                                                estimated_adv = Decimal("10000")  # ~10k BTC average for BTCUSDT
+                                                intention_type = self.iceberg_analyzer.classify_intention(
+                                                    hidden_volume=lvl.total_hidden_volume,
+                                                    adv_20d=estimated_adv
+                                                )
+                                                
+                                                # 4. Вычисляем IIR (Iceberg Impact Ratio)
+                                                iir_value = float(lvl.total_hidden_volume / estimated_adv) if estimated_adv > 0 else 0.0
+                                                
+                                                # 5. Создаем lifecycle event с классификацией
+                                                lifecycle_id = await self.repository.save_lifecycle_event(
+                                                    symbol=self.symbol,
+                                                    price=trade.price,
+                                                    is_ask=lvl.is_ask,
+                                                    event_type='REFILLED',
+                                                    total_volume_absorbed=lvl.total_hidden_volume,
+                                                    refill_count=lvl.refill_count,
+                                                    intention_type=intention_type,
+                                                    iir_value=iir_value
+                                                )
+                                                
+                                                # 6. Сохраняем feature snapshot
+                                                if lifecycle_id:
+                                                    await self.repository.save_feature_snapshot(lifecycle_id, snapshot)
+                                                
+                                                # 7. Сохраняем уровень
+                                                asyncio.create_task(self.repository.save_level(lvl, self.symbol))
+                                    
+                                    self.book.pending_refill_checks.remove(pending)
+                            
+                            if not self.book.validate_integrity():
+                                print("❌ Book integrity failed! Resyncing...")
                                 await self._resync()
                                 break
-                        except GapDetectedError:
-                            print("⚠️ Gap detected in order book. Resyncing...")
-                            await self._resync()
-                            break
-    
-                    # --- ВАРИАНТ Б: Сделка (TradeEvent) ---
-                    elif isinstance(event, TradeEvent):
-                        trade = event
+                    except GapDetectedError:
+                        print("⚠️ Gap detected in order book. Resyncing...")
+                        await self._resync()
+                        break
+
+                # --- ВАРИАНТ Б: Сделка (TradeEvent) ---
+                elif isinstance(event, TradeEvent):
+                    trade = event
                     
                     # === НОВОЕ: VPIN Update (Обновление токсичности потока) ===
                     # WHY: Рассчитываем VPIN при каждой сделке
@@ -645,14 +519,6 @@ class TradingEngine:
                     # === GEMINI FIX: Захват CVD Divergence (Data Fusion) ===
                     # WHY: Получаем cached divergence для передачи в analyze_with_timing()
                     current_divergence = self.accumulation_detector.get_current_divergence_state()
-                    
-                    # === FIX: Signal Leakage Protection (Gemini Critical Audit) ===
-                    # WHY: Во время WARMING_UP блокируем ВСЕ анализаторы сигналов,
-                    # но State Building продолжается (VPIN, CVD, Book updates).
-                    # Предотвращает: ложные whale alerts, айсберги, Wyckoff паттерны.
-                    # Источник: Gemini Audit - "Signal Leakage при warm-up"
-                    if self.is_warmup_active():
-                        continue  # Пропускаем весь analysis блок ниже
                     
                     # === ЛОГИКА АНАЛИЗА (ИЗ ТВОЕЙ СТАРОЙ ВЕРСИИ) ===
 
@@ -846,23 +712,8 @@ class TradingEngine:
                             })
                         except Exception as e:
                             print(f"❌ [ERROR] log_full_metric failed: {e}")
-                            
-                            # === КОНЕЦ ML LOGIC ==="
-                
-                # === FIX VULNERABILITY #6: Catch-all Error Boundary ===
-                # WHY: Если ЛЮБОЕ исключение прорвалось сквозь обработку, логируем и продолжаем
-                # ВАЖНО: GapDetectedError обработан выше (break + resync), здесь только общие ошибки
-                except GapDetectedError:
-                    # Должно обрабатываться в блоке OrderBookUpdate выше, но ловим на всякий случай
-                    print("⚠️ Gap detected. Resyncing...")
-                    await self._resync()
-                    break  # Прерываем обработку текущего batch
-                except Exception as e:
-                    # КРИТИЧНО: Не ломаем while True цикл, просто пропускаем битое событие
-                    print(f"❌ [ERROR BOUNDARY] Event processing failed: {type(e).__name__}: {e}")
-                    import traceback
-                    traceback.print_exc()  # Full stack trace для отладки
-                    continue  # Пропускаем событие, переходим к следующему
+                    
+                    # === КОНЕЦ ML LOGIC ==="
                   
     async def _produce_gex(self):
         """Фоновый процесс: Обновление GEX раз в минуту"""
@@ -1094,10 +945,11 @@ class TradingEngine:
         
         Returns:
             Decimal объем или 0 если уровня нет
-        
-        REFACTORED (Gemini): Теперь делегирует в domain.py (get_volume_at_price)
         """
-        return self.book.get_volume_at_price(price, is_ask)
+        if is_ask:
+            return self.book.asks.get(price, Decimal("0"))
+        else:
+            return self.book.bids.get(price, Decimal("0"))
     
     async def _periodic_cleanup_task(self, interval_seconds: int = 300):
         """
@@ -1276,9 +1128,9 @@ class TradingEngine:
     # GEMINI FIX: Periodic Cleanup (Fix: Zombie Icebergs)
     # ========================================================================
     
-    async def _periodic_cleanup_task(self, interval_seconds: int = 60):
+    async def _periodic_cleanup_task(self):
         """
-        WHY: Периодическая очистка зомби-айсбергов.
+        WHY: Периодическая очистка зомби-айсбергов (каждую минуту).
         
         ПРОБЛЕМА (Gemini Validation):
         - Айсберги без обновлений накапливались в памяти
@@ -1286,21 +1138,18 @@ class TradingEngine:
         - Память росла без ограничений
         
         РЕШЕНИЕ:
-        - Вызывает book.cleanup_old_icebergs() каждые interval_seconds
+        - Вызывает book.cleanup_old_icebergs() каждые 60 секунд
         - Threshold: min_confidence=0.1 (10%)
         - Half-life: 300 секунд (5 минут для swing)
-        
-        Args:
-            interval_seconds: Интервал между cleanup (default 60s для production, 1s для тестов)
         
         Логика:
         - Айсберги без обновлений >10 минут → confidence < 0.1 → удаляются
         - Свежие айсберги (<5 минут) → остаются
         """
-        print(f"🧹 Periodic Cleanup Task started (interval: {interval_seconds}s)...")
+        print("🧹 Periodic Cleanup Task started...")
         
-        # WHY: First iteration delay = interval_seconds (начинаем после первого интервала)
-        await asyncio.sleep(interval_seconds)
+        # WHY: First iteration delay = 60 (начинаем через минуту после старта)
+        await asyncio.sleep(60)
         
         while True:
             try:
@@ -1317,8 +1166,8 @@ class TradingEngine:
                 if removed_count > 0:
                     print(f"🧹 Cleaned up {removed_count} zombie iceberg(s)")
                 
-                # Повторяем каждые interval_seconds
-                await asyncio.sleep(interval_seconds)
+                # Повторяем каждые 60 секунд
+                await asyncio.sleep(60)
                 
             except asyncio.CancelledError:
                 print("🧹 Cleanup Task cancelled")
@@ -1326,5 +1175,5 @@ class TradingEngine:
             except Exception as e:
                 print(f"❌ Cleanup Task Error: {e}")
                 # Продолжаем работу даже при ошибках
-                await asyncio.sleep(interval_seconds)
+                await asyncio.sleep(60)
                 continue

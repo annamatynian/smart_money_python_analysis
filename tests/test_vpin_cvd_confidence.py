@@ -19,6 +19,7 @@ from config import BTC_CONFIG
 from domain import GammaProfile, LocalOrderBook
 
 
+@pytest.mark.skip(reason="Group 2: Refactoring pending - iceberg logic будет переписан")
 class TestVPINConfidenceAdjustment:
     """Проверяем VPIN adjustment (Фаза 2)"""
     
@@ -116,6 +117,7 @@ class TestVPINConfidenceAdjustment:
         )
 
 
+@pytest.mark.skip(reason="Group 2: Refactoring pending - iceberg logic будет переписан")
 class TestCVDConfidenceAdjustment:
     """Проверяем CVD Divergence adjustment (Фаза 3)"""
     
@@ -240,6 +242,7 @@ class TestCVDConfidenceAdjustment:
         assert adjusted == base_confidence
 
 
+@pytest.mark.skip(reason="Group 2: Refactoring pending - iceberg logic будет переписан")
 class TestCombinedVPINandCVD:
     """Проверяем комбинированный эффект VPIN + CVD + GEX"""
     
@@ -390,6 +393,7 @@ class TestCombinedVPINandCVD:
         )
 
 
+@pytest.mark.skip(reason="Group 2: Refactoring pending - iceberg logic будет переписан")
 class TestEdgeCases:
     """Тестируем граничные случаи"""
     

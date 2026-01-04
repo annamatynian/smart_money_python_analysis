@@ -45,8 +45,15 @@ class FeatureSnapshot:
     snapshot_time: datetime
     
     # === ORDERBOOK METRICS ===
-    obi_value: Optional[float] = None              # Order Book Imbalance
-    ofi_value: Optional[float] = None              # Order Flow Imbalance
+    # VULNERABILITY A FIX: Vectorized OBI (multiple depths)
+    obi_L1: Optional[float] = None                 # OBI at L1 (spread, tactical HFT)
+    obi_L5: Optional[float] = None                 # OBI at L5 (main liquidity)
+    obi_L20: Optional[float] = None                # OBI at L20 (strategic depth)
+    
+    # VULNERABILITY C FIX: Dual OFI (depth + volume based)
+    ofi_depth: Optional[float] = None              # Depth-based OFI (fast, HFT sensitive)
+    ofi_volume: Optional[float] = None             # Volume-based OFI (shift-resistant)
+    
     spread_bps: Optional[float] = None             # Спред в basis points
     depth_ratio: Optional[float] = None            # Bid depth / Ask depth
     
@@ -159,6 +166,11 @@ class FeatureCollector:
         # WHY: Кешируем basis/skew для неблокирующего capture_snapshot()
         self.cached_basis: Optional[float] = None  # Обновляется через _feed_derivatives_cache()
         self.cached_skew: Optional[float] = None   # Обновляется через _feed_derivatives_cache()
+        
+        # === FIX VULNERABILITY #4: Cold Start Warm-Up ===
+        # WHY: Предотвращает мусорные снапшоты на холодном старте
+        # Теория: ML модели требуют чистых данных, без артефактов инициализации
+        self.is_warmed_up: bool = False  # Флаг готовности к работе
     
     def update_price(self, price: float):
         """
@@ -171,34 +183,116 @@ class FeatureCollector:
             'price': price
         })
     
+    # ========================================================================
+    # FIX VULNERABILITY #4: Cold Start Warm-Up Methods
+    # ========================================================================
+    
+    def is_ready(self) -> bool:
+        """
+        WHY: Проверяет критерии готовности к созданию снапшотов.
+        
+        Критерии warm-up (Гемини Валидация):
+        1. State инициализирован: _last_whale_cvd != 0.0
+           WHY: Предотвращает whale_cvd=0.0 в первом снапшоте
+        
+        2. Price history заполнена: len(price_history) >= 60
+           WHY: 60 секунд = минимум для TWAP/volatility
+        
+        Returns:
+            bool: True если готов к работе
+        
+        Example:
+            >>> collector = FeatureCollector(order_book)
+            >>> collector.is_ready()  # False (холодный старт)
+            False
+            >>> # ... 60 секунд работы ...
+            >>> collector.is_ready()  # True
+            True
+        """
+        # Критерий 1: State инициализирован
+        # WHY: Хотя бы один CVD state должен быть не 0
+        state_initialized = (
+            self._last_whale_cvd != 0.0 or
+            self._last_minnow_cvd != 0.0 or
+            self._last_dolphin_cvd != 0.0
+        )
+        
+        # Критерий 2: Price history заполнена
+        # WHY: 60 точек = 1 минута при 1 Hz частоте update_price
+        has_price_history = len(self.price_history) >= 60
+        
+        return state_initialized and has_price_history
+    
+    def check_warmup(self) -> None:
+        """
+        WHY: Автоматически устанавливает флаг is_warmed_up при готовности.
+        
+        Использование:
+            # В TradingEngine после каждого update_price:
+            feature_collector.update_price(mid_price)
+            feature_collector.check_warmup()  # Auto-update флага
+        
+        Side effects:
+            Устанавливает self.is_warmed_up = True когда is_ready() == True
+        """
+        if not self.is_warmed_up and self.is_ready():
+            self.is_warmed_up = True
+    
     def capture_snapshot(
         self,
+        event_time: Optional[datetime] = None,
         historical_memory: Optional['HistoricalMemory'] = None,
-        iceberg: Optional['IcebergLevel'] = None
-    ) -> FeatureSnapshot:
+        iceberg: Optional['IcebergLevel'] = None,
+        skip_warmup_check: bool = False
+    ) -> Optional[FeatureSnapshot]:
         """
         WHY: Собирает текущее состояние ВСЕХ метрик.
         
-        FIX VULNERABILITY A: Throttling удален - теперь ВСЕГДА возвращает свежие данные.
+        FIX VULNERABILITY #2: Clock Skew (Python vs Postgres)
+        - event_time берется из OrderBookUpdate.event_time (Exchange source of truth)
+        - Гарантирует синхронизацию с SQL date_bin() при merge_asof
+        - Устраняет processing lag и clock drift между контейнерами
+        
+        FIX VULNERABILITY #4: Cold Start Warm-Up
+        - Возвращает None если is_warmed_up == False
+        - Предотвращает мусорные снапшоты в ML датасете
         
         Гарантии:
         - Неблокирующий (только чтение из памяти)
         - Никаких сетевых запросов
         - Толерантен к отсутствию данных (возвращает None)
         - Всегда обновляет state для CVD delta (критично!)
+        - Time-Deterministic: одинаковый event_time = одинаковый snapshot_time
         
         Args:
+            event_time: Exchange timestamp (from OrderBookUpdate.event_time). If None, fallback to datetime.now()
             historical_memory: Исторические данные для whale CVD trends
             iceberg: Айсберг для spoofing features (опционально)
+            skip_warmup_check: True = skip warm-up check (для unit-тестов Clock Skew)
         
         Returns:
-            FeatureSnapshot с заполненными полями (None если метрика недоступна)
+            FeatureSnapshot: Снапшот с заполненными полями
+            None: Если is_warmed_up == False (холодный старт)
         """
-        now = datetime.now(timezone.utc)
+        # FIX VULNERABILITY #2: Use exchange time if provided, fallback to now()
+        now = event_time if event_time else datetime.now(timezone.utc)
         
-        # === ORDERBOOK METRICS ===
-        obi = self._get_obi()
-        ofi = self._get_ofi()  # FIX: Читаем напрямую из book, как OBI и CVD
+        # === FIX VULNERABILITY #4: Cold Start Guard ===
+        # WHY: Не возвращаем мусорные снапшоты на холодном старте
+        # Критерии: state инициализирован + 60 секунд price history
+        # EXCEPT: skip_warmup_check=True для unit-тестов (тестируют другую логику)
+        if not skip_warmup_check and not self.is_warmed_up:
+            return None
+        
+        # === VULNERABILITY A FIX: Vectorized OBI (multiple depths) ===
+        obi_L1 = self._get_vectorized_obi(depth=1)
+        obi_L5 = self._get_vectorized_obi(depth=5)
+        obi_L20 = self._get_vectorized_obi(depth=20)
+        
+        # === VULNERABILITY C FIX: Dual OFI ===
+        ofi_depth = self._get_depth_ofi()  # Existing calculate_ofi()
+        ofi_volume = self._get_volume_ofi()  # New volume-based
+        
         spread_bps = self._get_spread_bps()
         depth_ratio = self._get_depth_ratio()
         
@@ -219,7 +313,10 @@ class FeatureCollector:
         dist_gamma, gamma_type = self._get_gamma_wall_info()
         
         # === PRICE METRICS ===
-        current_price = self._get_current_price()
+        # FIX VULNERABILITY #4: _get_current_price() теперь возвращает Decimal
+        current_price_decimal = self._get_current_price()
+        # Конвертируем в float ТОЛЬКО для FeatureSnapshot (DB storage)
+        current_price = float(current_price_decimal) if current_price_decimal else None
         twap_5m = self._calculate_twap(minutes=5)
         price_vs_twap = self._calculate_price_vs_twap(current_price, twap_5m)
         volatility_1h = self._calculate_volatility(minutes=60)
@@ -274,9 +371,12 @@ class FeatureCollector:
         snapshot = FeatureSnapshot(
             snapshot_time=now,
             
-            # Orderbook
-            obi_value=obi,
-            ofi_value=ofi,
+            # === VULNERABILITY A & C FIXES ===
+            obi_L1=obi_L1,
+            obi_L5=obi_L5,
+            obi_L20=obi_L20,
+            ofi_depth=ofi_depth,
+            ofi_volume=ofi_volume,
             spread_bps=spread_bps,
             depth_ratio=depth_ratio,
             
@@ -625,6 +725,68 @@ class FeatureCollector:
         return (whale or 0) + (fish or 0) + (dolphin or 0)
     
     
+    
+    # ========================================================================
+    # VULNERABILITY FIXES: Vectorized OBI + Dual OFI
+    # ========================================================================
+    
+    def _get_vectorized_obi(self, depth: int) -> Optional[float]:
+        """
+        WHY: Calculates OBI at specific depth (L1/L5/L20).
+        
+        VULNERABILITY A FIX: Provides multiple depth perspectives.
+        
+        Args:
+            depth: Number of price levels (1, 5, or 20)
+        
+        Returns:
+            float: OBI at this depth or None
+        """
+        if not self.order_book:
+            return None
+        try:
+            # use_exponential=True for L5/L20 (anti-spoofing)
+            # use_exponential=False for L1 (raw spread signal)
+            use_exp = (depth > 1)
+            return self.order_book.get_weighted_obi(depth=depth, use_exponential=use_exp)
+        except:
+            return None
+    
+    def _get_depth_ofi(self) -> Optional[float]:
+        """
+        WHY: Depth-based OFI (existing calculate_ofi method).
+        
+        VULNERABILITY C FIX: Fast baseline OFI.
+        
+        Returns:
+            float: OFI value or None
+        """
+        if not self.order_book:
+            return None
+        try:
+            return self.order_book.calculate_ofi()
+        except:
+            return None
+    
+    def _get_volume_ofi(self) -> Optional[float]:
+        """
+        WHY: Volume-based OFI (new method from domain.py).
+        
+        VULNERABILITY C FIX: Price-shift resistant OFI.
+        
+        Returns:
+            float: Volume-based OFI or None
+        """
+        if not self.order_book:
+            return None
+        try:
+            # Use config.spoofing_volume_threshold * 5 as target_volume
+            # WHY: ~50 BTC for BTCUSDT, adaptive per asset
+            target_vol = float(self.order_book.config.spoofing_volume_threshold) * 5
+            return self.order_book.get_volume_based_ofi(target_volume=target_vol)
+        except:
+            return None
+    
     def _get_whale_cvd_delta(self, minutes: int) -> Optional[float]:
         """Изменение whale CVD за N минут"""
         # TODO: Требует исторического tracking
@@ -719,21 +881,31 @@ class FeatureCollector:
             return None
     
     def _get_gamma_wall_info(self) -> tuple[Optional[float], Optional[str]]:
-        """Расстояние до ближайшей gamma wall и её тип"""
+        """
+        Расстояние до ближайшей gamma wall и её тип.
+        
+        FIX VULNERABILITY #4: Передаём Decimal в get_gamma_wall_distance().
+        """
         if not self.gamma:
             return None, None
         try:
-            # FIX: Lobotomy Issue - используем GammaProvider.get_gamma_wall_distance()
-            current_price = self._get_current_price()
-            if current_price is None:
+            # FIX: _get_current_price() теперь возвращает Decimal
+            current_price_decimal = self._get_current_price()
+            if current_price_decimal is None:
                 return None, None
             
-            return self.gamma.get_gamma_wall_distance(current_price)
+            # Передаём Decimal в get_gamma_wall_distance() (не float!)
+            return self.gamma.get_gamma_wall_distance(current_price_decimal)
         except:
             return None, None
     
-    def _get_current_price(self) -> Optional[float]:
-        """Текущая mid price"""
+    def _get_current_price(self) -> Optional[Decimal]:
+        """
+        FIX VULNERABILITY #4: Возвращает Decimal mid price.
+        
+        WHY: Для точного сравнения с gamma_profile.call/put_wall.
+        Конвертация в float происходит ТОЛЬКО при записи в FeatureSnapshot.
+        """
         if not self.order_book:
             return None
         try:
@@ -742,9 +914,9 @@ class FeatureCollector:
             ask_tuple = self.order_book.get_best_ask()  # Returns (price, qty) or None
             
             if bid_tuple and ask_tuple:
-                bid = bid_tuple[0]  # Извлекаем цену
-                ask = ask_tuple[0]
-                return float((bid + ask) / 2)
+                bid = bid_tuple[0]  # Decimal price
+                ask = ask_tuple[0]  # Decimal price
+                return (bid + ask) / Decimal("2")  # Decimal mid price
         except:
             pass
         return None

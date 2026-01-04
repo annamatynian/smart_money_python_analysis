@@ -18,6 +18,17 @@ from decimal import Decimal
 from datetime import datetime, timedelta
 from domain import IcebergLevel, CancellationContext, IcebergStatus
 from analyzers import SpoofingAnalyzer
+from config import BTC_CONFIG
+
+
+# ===========================================================================
+# FIXTURES
+# ===========================================================================
+
+@pytest.fixture
+def analyzer():
+    """WHY: GEMINI FIX - SpoofingAnalyzer теперь требует config"""
+    return SpoofingAnalyzer(config=BTC_CONFIG)
 
 
 # ===========================================================================
@@ -137,7 +148,7 @@ def test_refill_frequency_high_activity():
 # ТЕСТЫ SpoofingAnalyzer._analyze_duration()
 # ===========================================================================
 
-def test_analyze_duration_instant_spoofing():
+def test_analyze_duration_instant_spoofing(analyzer):
     """WHY: Айсберг <5 сек = гарантированно спуфинг"""
     iceberg = IcebergLevel(
         price=Decimal("100000"),
@@ -145,11 +156,12 @@ def test_analyze_duration_instant_spoofing():
         creation_time=datetime.now() - timedelta(seconds=2)
     )
     
-    score = SpoofingAnalyzer._analyze_duration(iceberg)
-    assert score == 1.0
+    score = analyzer._analyze_duration(iceberg)
+    # FIX: Теперь используем smooth function (не step)
+    assert score > 0.8  # Очень короткий lifetime
 
 
-def test_analyze_duration_hft():
+def test_analyze_duration_hft(analyzer):
     """WHY: Айсберг 30 сек = вероятно HFT"""
     iceberg = IcebergLevel(
         price=Decimal("100000"),
@@ -157,11 +169,12 @@ def test_analyze_duration_hft():
         creation_time=datetime.now() - timedelta(seconds=30)
     )
     
-    score = SpoofingAnalyzer._analyze_duration(iceberg)
-    assert score == 0.7
+    score = analyzer._analyze_duration(iceberg)
+    # FIX: Smooth function → 1/(1+0.1*30) = 0.25
+    assert 0.2 < score < 0.3
 
 
-def test_analyze_duration_swing_level():
+def test_analyze_duration_swing_level(analyzer):
     """WHY: Айсберг >5 мин = реальный уровень"""
     iceberg = IcebergLevel(
         price=Decimal("100000"),
@@ -169,15 +182,16 @@ def test_analyze_duration_swing_level():
         creation_time=datetime.now() - timedelta(minutes=10)
     )
     
-    score = SpoofingAnalyzer._analyze_duration(iceberg)
-    assert score == 0.0
+    score = analyzer._analyze_duration(iceberg)
+    # FIX: 10 мин = 600 сек → 1/(1+0.1*600) = 0.016
+    assert score < 0.05
 
 
 # ===========================================================================
 # ТЕСТЫ SpoofingAnalyzer._analyze_cancellation_context()
 # ===========================================================================
 
-def test_analyze_cancellation_no_context():
+def test_analyze_cancellation_no_context(analyzer):
     """WHY: Нет контекста отмены = score 0.0"""
     iceberg = IcebergLevel(
         price=Decimal("100000"),
@@ -185,7 +199,7 @@ def test_analyze_cancellation_no_context():
         cancellation_context=None
     )
     
-    score = SpoofingAnalyzer._analyze_cancellation_context(
+    score = analyzer._analyze_cancellation_context(
         iceberg, 
         Decimal("100000"), 
         []
@@ -193,7 +207,7 @@ def test_analyze_cancellation_no_context():
     assert score == 0.0
 
 
-def test_analyze_cancellation_classic_spoofing():
+def test_analyze_cancellation_classic_spoofing(analyzer):
     """WHY: Классический спуфинг - отмена при приближении цены"""
     ctx = CancellationContext(
         mid_price_at_cancel=Decimal("99950"),  # Близко к уровню
@@ -209,7 +223,7 @@ def test_analyze_cancellation_classic_spoofing():
         cancellation_context=ctx
     )
     
-    score = SpoofingAnalyzer._analyze_cancellation_context(
+    score = analyzer._analyze_cancellation_context(
         iceberg,
         Decimal("99950"),
         []
@@ -220,7 +234,7 @@ def test_analyze_cancellation_classic_spoofing():
     assert abs(score - 1.0) < 0.01  # Допуск на float precision
 
 
-def test_analyze_cancellation_legitimate():
+def test_analyze_cancellation_legitimate(analyzer):
     """WHY: Легитимная отмена - цена уходила ОТ уровня"""
     ctx = CancellationContext(
         mid_price_at_cancel=Decimal("98000"),  # Далеко от уровня
@@ -236,7 +250,7 @@ def test_analyze_cancellation_legitimate():
         cancellation_context=ctx
     )
     
-    score = SpoofingAnalyzer._analyze_cancellation_context(
+    score = analyzer._analyze_cancellation_context(
         iceberg,
         Decimal("98000"),
         []
@@ -250,7 +264,7 @@ def test_analyze_cancellation_legitimate():
 # ТЕСТЫ SpoofingAnalyzer._analyze_execution_pattern()
 # ===========================================================================
 
-def test_analyze_execution_high_frequency():
+def test_analyze_execution_high_frequency(analyzer):
     """WHY: Высокая частота рефиллов = легитимный алго"""
     iceberg = IcebergLevel(
         price=Decimal("100000"),
@@ -260,11 +274,11 @@ def test_analyze_execution_high_frequency():
         total_hidden_volume=Decimal("5.0")
     )
     
-    score = SpoofingAnalyzer._analyze_execution_pattern(iceberg)
+    score = analyzer._analyze_execution_pattern(iceberg)
     assert score == 0.0
 
 
-def test_analyze_execution_low_frequency():
+def test_analyze_execution_low_frequency(analyzer):
     """WHY: Низкая частота + малый объем = спуфинг"""
     iceberg = IcebergLevel(
         price=Decimal("100000"),
@@ -274,7 +288,7 @@ def test_analyze_execution_low_frequency():
         total_hidden_volume=Decimal("0.05")  # Крошечный объем
     )
     
-    score = SpoofingAnalyzer._analyze_execution_pattern(iceberg)
+    score = analyzer._analyze_execution_pattern(iceberg)
     assert score > 0.5  # Должен быть подозрителен
 
 
@@ -282,7 +296,7 @@ def test_analyze_execution_low_frequency():
 # ИНТЕГРАЦИОННЫЙ ТЕСТ calculate_spoofing_probability
 # ===========================================================================
 
-def test_calculate_spoofing_probability_clear_spoof():
+def test_calculate_spoofing_probability_clear_spoof(analyzer):
     """WHY: Очевидный спуфинг - все признаки указывают на манипуляцию"""
     ctx = CancellationContext(
         mid_price_at_cancel=Decimal("99990"),
@@ -301,18 +315,18 @@ def test_calculate_spoofing_probability_clear_spoof():
         total_hidden_volume=Decimal("0.08")
     )
     
-    prob = SpoofingAnalyzer.calculate_spoofing_probability(
+    prob = analyzer.calculate_spoofing_probability(
         iceberg,
         Decimal("99990"),
         []
     )
     
-    # Duration: 1.0 (30%) + Cancellation: 1.0 (50%) + Execution: ~0.8 (20%)
-    # = 0.3 + 0.5 + 0.16 = 0.96 (но из-за refill_freq расчета может быть ~0.86)
-    assert prob >= 0.85  # Снижаем порог с учетом реальных расчетов
+    # FIX: Smooth duration → ниже scores
+    # Duration: ~0.77 (30%) + Cancellation: 1.0 (50%) + Execution: ~0.8 (20%)
+    assert prob >= 0.7  # Снижаем с учетом smooth function
 
 
-def test_calculate_spoofing_probability_legitimate():
+def test_calculate_spoofing_probability_legitimate(analyzer):
     """WHY: Легитимный уровень - долгий, активный, не отменен"""
     iceberg = IcebergLevel(
         price=Decimal("100000"),
@@ -323,18 +337,18 @@ def test_calculate_spoofing_probability_legitimate():
         total_hidden_volume=Decimal("10.0")  # Большой объем
     )
     
-    prob = SpoofingAnalyzer.calculate_spoofing_probability(
+    prob = analyzer.calculate_spoofing_probability(
         iceberg,
         Decimal("100000"),
         []
     )
     
-    # Duration: 0.0 (30%) + Cancellation: 0.0 (50%) + Execution: 0.0 (20%)
-    # = 0.0
+    # Duration: ~0.016 (30%) + Cancellation: 0.0 (50%) + Execution: 0.0 (20%)
+    # = 0.005
     assert prob < 0.1
 
 
-def test_edge_case_short_lived_but_heavily_executed():
+def test_edge_case_short_lived_but_heavily_executed(analyzer):
     """
     WHY: Спорный случай - айсберг жил 10 сек (подозрительно), 
     НО исполнился на 40% (это реальные деньги, не спуфинг)
@@ -358,16 +372,15 @@ def test_edge_case_short_lived_but_heavily_executed():
         total_hidden_volume=Decimal("2.0")
     )
     
-    prob = SpoofingAnalyzer.calculate_spoofing_probability(
+    prob = analyzer.calculate_spoofing_probability(
         iceberg,
         Decimal("99980"),
         []
     )
     
-    # Duration: ~0.5 (10 сек), Cancellation: ~0.6 (близко + двигалась), Execution: ~0.3
-    # = 0.5*0.3 + 0.6*0.5 + 0.3*0.2 = 0.15 + 0.3 + 0.06 = 0.51
+    # FIX: Smooth duration → 10 сек = 0.5
+    # Duration: ~0.5, Cancellation: ~0.6, Execution: ~0.3
     # НО volume_executed=40% должен снизить Cancellation score!
-    # В реальности должно быть < 0.6
     assert prob < 0.6, f"Expected prob < 0.6 for 40% executed, got {prob}"
 
 

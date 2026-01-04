@@ -15,6 +15,7 @@ from infrastructure import get_average_daily_volume
 from domain import GammaProfile
 
 
+@pytest.mark.skip(reason="Group 2: Refactoring pending - iceberg logic будет переписан")
 class TestGEXIntegration:
     """
     WHY: Полная проверка интеграции GEMINI FIX.

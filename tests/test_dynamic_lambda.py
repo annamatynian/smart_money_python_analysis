@@ -189,7 +189,13 @@ def test_lambda_affects_weight_calculation(lambda_val, expected_weight_08pct):
         min_minnow_floor_usd=10.0,
         spoofing_volume_threshold=Decimal("0.1"),
         breach_tolerance_pct=Decimal("0.001"),
-        lambda_decay=lambda_val  # ← ПАРАМЕТР
+        lambda_decay=lambda_val,  # ← ПАРАМЕТР
+        accumulation_whale_threshold=Decimal("1.0"),  # FIX: Required field
+        # === GEMINI FIX: Новые параметры ===
+        native_refill_max_ms=5,
+        synthetic_refill_max_ms=50,
+        synthetic_cutoff_ms=30,
+        synthetic_probability_decay=0.15
     )
     
     book = LocalOrderBook(symbol="TESTUSDT", config=custom_config)

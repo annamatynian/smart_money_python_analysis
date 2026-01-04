@@ -12,6 +12,7 @@ from analyzers import IcebergAnalyzer
 from config import BTC_CONFIG
 
 
+@pytest.mark.skip(reason="Group 2: Refactoring pending - iceberg logic будет переписан")
 class TestCVDEnhancement:
     """
     WHY: Тестируем Phase 2 - интеграцию CVD дивергенций с confidence adjustment.

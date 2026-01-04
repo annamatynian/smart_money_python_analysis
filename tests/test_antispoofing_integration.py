@@ -63,7 +63,7 @@ class TestAntiSpoofingIntegration:
         )
         
         # Создаем SpoofingAnalyzer
-        analyzer = SpoofingAnalyzer()
+        analyzer = SpoofingAnalyzer(config=BTC_CONFIG)  # FIX: GEMINI - требует config
         
         # Рассчитываем spoofing probability
         current_mid = Decimal('50100')
@@ -96,7 +96,7 @@ class TestAntiSpoofingIntegration:
             confidence=0.90  # Высокая базовая уверенность
         )
         
-        analyzer = SpoofingAnalyzer()
+        analyzer = SpoofingAnalyzer(config=BTC_CONFIG)  # FIX: GEMINI - требует config
         
         # Симулируем короткоживущий айсберг (spoofing_prob = 1.0)
         spoofing_prob = 1.0  # 100% вероятность спуфинга

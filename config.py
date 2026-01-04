@@ -15,6 +15,14 @@ class AssetConfig:
     min_hidden_volume: Decimal      # Минимальный скрытый объем (в монетах!)
     min_iceberg_ratio: Decimal      # hidden/total ratio
     
+    # === GEMINI FIX: Native vs Synthetic Iceberg Split ===
+    # WHY: Разделение детекции на Native (биржевой refill) и Synthetic (API боты)
+    # Теория: Документ "Идентификация айсберг-ордеров", раздел 1.2
+    native_refill_max_ms: int           # Native: exchange kernel refill (100μs-10ms)
+    synthetic_refill_max_ms: int        # Synthetic: API roundtrip (10-50ms)
+    synthetic_cutoff_ms: int            # τ для sigmoid (точка перехода P=0.5)
+    synthetic_probability_decay: float  # α для sigmoid (крутизна)
+    
     # --- 3. Gamma Walls ---
     # Лучше использовать % от цены, а не фикс USD, но если USD, то настраивать точно
     gamma_wall_tolerance_pct: Decimal  # 0.001 = 0.1% от цены
@@ -32,8 +40,15 @@ class AssetConfig:
     accumulation_whale_threshold: Decimal
     
     # --- 5. Spoofing & Breach ---
+    # ⚠️ PRODUCTION CALIBRATION WARNING (Gemini Validation - Dec 2025):
+    # Текущие значения (особенно для SOL и ETH) являются РАЗУМНЫМИ СТАРТОВЫМИ ТОЧКАМИ,
+    # но ТРЕБУЮТ КАЛИБРОВКИ на реальных исторических данных перед деплоем.
+    # Пример: SOL spoofing_distance_pct=2.0% может быть слишком широким на спокойном рынке.
+    # Рекомендация: Собрать 1-2 месяца данных, провести бэктест с разными значениями,
+    # выбрать threshold с лучшим precision/recall для детекции spoofing.
     spoofing_volume_threshold: Decimal  # Порог объема для подозрений (в монетах!)
-    breach_tolerance_pct: Decimal       # % толеранс для пробоя
+    spoofing_distance_pct: Decimal = Decimal("0.005")  # WHY: GEMINI FIX - Порог "близости" для отмены (default 0.5%)
+    breach_tolerance_pct: Decimal = Decimal("0.0005")  # WHY: Default 0.05% толеранс для пробоя
     
     # --- 6. OBI Exponential Decay ---
     # ⚠️ PRODUCTION CALIBRATION WARNING (Gemini Validation):
@@ -54,6 +69,15 @@ class AssetConfig:
     # === GEMINI FIX: Real-Time VPIN Parameters ===
     vpin_inclusion_threshold: float = 0.2       # WHY: Включать current_bucket если заполнен > 20%
     vpin_stale_threshold_seconds: int = 300     # WHY: Считать VPIN stale через 5 мин простоя (swing trading)
+    
+    # === WARM-UP PERIOD (State Recovery Protection) ===
+    # WHY: При reconnect/cold start система получает "лавину" обновлений.
+    # Таймстампы могут быть некорректными, delta_t искусственно малым.
+    # Это приводит к Ghost Trades - ложным детекциям айсбергов/VPIN.
+    # Решение: Warm-up Period - система строит состояние (State Building),
+    # но НЕ генерирует сигналы (Signal Suppression).
+    # Источник: "Critical Audit of Cryptocurrency HFT Iceberg Detection System", Section: State Recovery
+    warmup_period_ms: int = 2000  # WHY: 2 секунды достаточно чтобы WebSocket буфер опустел и джиттер стабилизировался
 
 # --- КОНФИГУРАЦИИ ---
 
@@ -65,6 +89,11 @@ BTC_CONFIG = AssetConfig(
     # Iceberg
     min_hidden_volume=Decimal("0.05"),
     min_iceberg_ratio=Decimal("0.3"),
+    # Native/Synthetic Split (GEMINI FIX)
+    native_refill_max_ms=5,            # WHY: BTC Binance kernel fast (~5ms)
+    synthetic_refill_max_ms=50,        # WHY: Standard API roundtrip
+    synthetic_cutoff_ms=30,            # WHY: Sigmoid midpoint
+    synthetic_probability_decay=0.15,  # WHY: Moderate steepness
     # Gamma (0.1% от 100k = $100)
     gamma_wall_tolerance_pct=Decimal("0.001"), 
     # Whale
@@ -76,6 +105,7 @@ BTC_CONFIG = AssetConfig(
     accumulation_whale_threshold=Decimal("2.0"),  # WHY: 2.0 BTC ≈ $200k (кит, R_abs>10)
     # Risk
     spoofing_volume_threshold=Decimal("0.1"),
+    spoofing_distance_pct=Decimal("0.005"),  # WHY: GEMINI FIX - 0.5% (текущий hardcode)
     breach_tolerance_pct=Decimal("0.0005"),
     # OBI
     lambda_decay=0.1,  # WHY: BTC узкие спреды → агрессивная фильтрация
@@ -96,6 +126,11 @@ ETH_CONFIG = AssetConfig(
     # Iceberg
     min_hidden_volume=Decimal("1.0"), # 1 ETH
     min_iceberg_ratio=Decimal("0.3"),
+    # Native/Synthetic Split (GEMINI FIX)
+    native_refill_max_ms=5,            # WHY: ETH на той же Binance → ~5ms
+    synthetic_refill_max_ms=50,
+    synthetic_cutoff_ms=30,
+    synthetic_probability_decay=0.15,
     # Gamma
     gamma_wall_tolerance_pct=Decimal("0.0015"), # Чуть шире для ETH
     # Whale
@@ -107,6 +142,7 @@ ETH_CONFIG = AssetConfig(
     accumulation_whale_threshold=Decimal("30.0"),  # WHY: 30 ETH ≈ $100k (кит, R_abs>10)
     # Risk
     spoofing_volume_threshold=Decimal("2.0"),
+    spoofing_distance_pct=Decimal("0.01"),  # WHY: GEMINI FIX - 1.0% (шире из-за volatility)
     breach_tolerance_pct=Decimal("0.001"),
     # OBI
     lambda_decay=0.05,  # WHY: ETH шире спреды → мягче фильтр
@@ -126,6 +162,11 @@ SOL_CONFIG = AssetConfig(
     price_display_format="{:,.3f}",   # 145.235 (больше точности)
     min_hidden_volume=Decimal("10.0"),
     min_iceberg_ratio=Decimal("0.3"),
+    # Native/Synthetic Split (GEMINI FIX)
+    native_refill_max_ms=10,           # WHY: SOL менее ликвидный → 10ms threshold
+    synthetic_refill_max_ms=50,
+    synthetic_cutoff_ms=30,
+    synthetic_probability_decay=0.15,
     gamma_wall_tolerance_pct=Decimal("0.005"),  # WHY: Gemini - SOL lower liquidity → wider tolerance (0.5%)
     static_whale_threshold_usd=25000.0,
     static_minnow_threshold_usd=200.0,
@@ -134,6 +175,7 @@ SOL_CONFIG = AssetConfig(
     # Accumulation
     accumulation_whale_threshold=Decimal("500.0"),  # WHY: 500 SOL ≈ $100k (кит, R_abs>10)
     spoofing_volume_threshold=Decimal("20.0"),
+    spoofing_distance_pct=Decimal("0.02"),  # WHY: GEMINI FIX - 2.0% (SOL очень volatility!)
     breach_tolerance_pct=Decimal("0.001"),
     lambda_decay=0.03,  # WHY: SOL очень волатильный → минимальная фильтрация
     ofi_depth=50,  # WHY: SOL очень волатильный → максимальная глубина

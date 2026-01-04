@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Dict, List, Tuple, Optional # Добавьте List
 from collections import deque
 from enum import Enum
+import math  # WHY: For exp() in volume-based OFI anti-spoofing
 
 # WHY: Импорт конфигурации для мульти-токен поддержки (Task: Multi-Asset Support)
 from config import AssetConfig, get_config
@@ -28,12 +29,17 @@ class GammaProfile(BaseModel):
     
     === GEMINI FIX: GEX Normalization + Expiration Decay ===
     Добавлены поля для устранения Non-Stationarity и Expiration Cliff проблем.
+    
+    === FIX VULNERABILITY #4: Decimal Precision ===
+    call_wall/put_wall теперь Decimal (вместо float) для точного сравнения с ценами.
+    WHY: При сравнении Decimal цен из LocalOrderBook с float gamma walls теряется точность.
+    Критично для altcoins с tight tolerance (SOL, low-cap tokens).
     """
     total_gex: float      # Общая гамма (Барометр: гасят волатильность или разгоняют)
     # NEW: Нормализованная гамма (GEX / ADV_20d). 1.0 = GEX равен дневному объему
     total_gex_normalized: Optional[float] = None
-    call_wall: float      # Уровень сопротивления (где дилеры продают)
-    put_wall: float       # Уровень поддержки (где дилеры покупают)
+    call_wall: Decimal    # FIX: Decimal для точного сравнения (было float)
+    put_wall: Decimal     # FIX: Decimal для точного сравнения (было float)
     timestamp: datetime = Field(default_factory=datetime.now)
     # NEW: Время ближайшей экспирации опционов (Friday 08:00 UTC)
     expiry_timestamp: Optional[datetime] = None
@@ -987,6 +993,14 @@ class LocalOrderBook(BaseModel):
     # Структура: [{'trade': TradeEvent, 'visible_before': Decimal, 'trade_time_ms': int, 'price': Decimal, 'is_ask': bool}, ...]
     pending_refill_checks: deque = Field(default_factory=deque)
     
+    # === REGIME ADAPTATION: Spread Statistics (Task: Dynamic Threshold Adjustment) ===
+    # WHY: Track spread history for calculating volatility-based threshold scaling
+    # 3000 points = ~5 minutes at 10 updates/sec (market microstructure resolution)
+    _spread_history: deque = Field(default_factory=lambda: deque(maxlen=3000))
+    spread_mean: Optional[float] = None  # Rolling mean of spread (recalc every 100 updates)
+    spread_std: Optional[float] = None   # Rolling std dev (for Z-score normalization)
+    _spread_update_counter: int = 0      # Update stats every 100 updates (performance)
+    
     # === НОВОЕ ПОЛЕ ДЛЯ VPIN (Task: Flow Toxicity) ===
     # WHY: История корзин для расчёта VPIN (Volume-Synchronized Probability of Informed Trading)
     # Храним последние N корзин (обычно 50) для скользящего окна
@@ -1062,8 +1076,26 @@ class LocalOrderBook(BaseModel):
         
         if update.final_update_id:
             self.last_update_id = update.final_update_id
+
+        spread = self.get_spread()
+        if spread:
+            self._spread_history.append(spread)
+            self._spread_update_counter += 1
+        
+            if self._spread_update_counter >= 100:
+                self.update_spread_stats()
+                self._spread_update_counter = 0
         
         return True
+
+    def update_spread_stats(self):
+        """Call every 100 updates. Recalculates mean/std from _spread_history."""
+        if len(self._spread_history) < 100:
+            return  # Not enough data
+        
+        spreads = [float(s) for s in self._spread_history]
+        self.spread_mean = statistics.mean(spreads)
+        self.spread_std = statistics.stdev(spreads)
 
     def _process_side(self, book_side: Dict[Decimal, Decimal], 
                      updates: List[Tuple[Decimal, Decimal]]):
@@ -1130,6 +1162,25 @@ class LocalOrderBook(BaseModel):
         if not self.asks: return None
         # Asks сортированы по возрастанию (103, 104, 105). Лучший - первый.
         return self.asks.peekitem(0)
+    
+    def get_volume_at_price(self, price: Decimal, is_ask: bool) -> Decimal:
+        """
+        WHY: Инкапсуляция доступа к объему на ценовом уровне.
+        
+        Возвращает объем на уровне или 0 если уровня нет.
+        Скрывает детали реализации (SortedDict) от внешних слоев.
+        
+        Args:
+            price: Ценовой уровень
+            is_ask: True если Ask (сопротивление), False если Bid (поддержка)
+        
+        Returns:
+            Decimal: Объем на уровне или Decimal("0")
+        
+        Source: Gemini Refactoring - устранение нарушения инкапсуляции
+        """
+        book_side = self.asks if is_ask else self.bids
+        return book_side.get(price, Decimal("0"))
 
     def get_spread(self) -> Optional[Decimal]:
         bid = self.get_best_bid()
@@ -1983,7 +2034,13 @@ class LocalOrderBook(BaseModel):
         
         # 1. Проверяем каждый айсберг
         for price, iceberg in self.active_icebergs.items():
-            # 2. Вычисляем decayed confidence
+            # === FIX: Удаляем BREACHED айсберги НЕЗАВИСИМО от confidence ===
+            # WHY: BREACHED = уровень пробит, больше не актуален для торговли
+            if iceberg.status == IcebergStatus.BREACHED:
+                icebergs_to_remove.append(price)
+                continue
+            
+            # 2. Вычисляем decayed confidence для ACTIVE айсбергов
             decayed_confidence = iceberg.get_decayed_confidence(
                 current_time,
                 half_life_seconds=half_life_seconds
@@ -1999,6 +2056,123 @@ class LocalOrderBook(BaseModel):
             removed_count += 1
         
         return removed_count
+    
+    # ========================================================================
+    # VULNERABILITY C FIX: Volume-Based OFI (Claude + Gemini Dual OFI)
+    # ========================================================================
+    
+    def get_volume_based_ofi(
+        self,
+        target_volume: float,
+        use_exponential: bool = True
+    ) -> float:
+        """
+        WHY: Рассчитывает OFI на основе фиксированного объёма (Volume-Based OFI).
+        
+        === VULNERABILITY C FIX ===
+        Проблема: Depth-based OFI подвержен артефактам при сдвиге BBO.
+        Решение: Вместо "топ-20 уровней" берём "первые N BTC ликвидности".
+        
+        === ANTI-SPOOFING PROTECTION ===
+        Применяет exponential decay (как в weighted OBI) для фильтрации спуфов.
+        Без этого спуф на -2% = "реальный приток" (ошибка Gemini).
+        
+        Теория:
+        - Инвариантен к цене (10 BTC на $60k или $100k = одинаковый сигнал)
+        - Защита от Price Shift Artifact
+        - Интеграция с VPIN bucket_volume логикой
+        
+        Args:
+            target_volume: Глубина анализа в монетах (например, 5.0 BTC)
+            use_exponential: True = применить anti-spoofing decay
+        
+        Returns:
+            float: OFI значение (positive = buying pressure)
+        
+        Example:
+            >>> # Volume-Based OFI для 10 BTC ликвидности
+            >>> ofi = book.get_volume_based_ofi(target_volume=10.0)
+        """
+        if not self.previous_bid_snapshot or not self.previous_ask_snapshot:
+            return 0.0
+        
+        mid_price = self.get_mid_price()
+        if not mid_price:
+            return 0.0
+        
+        # Вспомогательная функция для сбора ликвидности
+        def accumulate_volume(levels_dict, is_ask: bool) -> Dict[Decimal, float]:
+            """
+            WHY: Собирает первые target_volume монет ликвидности.
+            
+            Args:
+                levels_dict: SortedDict с уровнями
+                is_ask: True для ASK (берём с начала), False для BID (с конца)
+            
+            Returns:
+                Dict[Decimal, float]: {price: weighted_quantity}
+            """
+            accumulated = 0.0
+            relevant_levels = {}
+            
+            # ✅ PERFORMANCE FIX: Zero-Copy iterator (Gemini + Claude optimization)
+            # Используем .items() вместо .keys() → убирает list() allocation + dict lookup
+            if is_ask:
+                iterator = levels_dict.items()  # ASK: ascending order
+            else:
+                iterator = reversed(levels_dict.items())  # BID: descending order
+            
+            for px, qty in iterator:  # ← Tuple unpacking, zero lookups!
+                qty = float(qty)
+                remaining = target_volume - accumulated
+                
+                if remaining <= 0:
+                    break
+                
+                # Берём либо всё qty, либо остаток
+                take_qty = min(qty, remaining)
+                
+                # === ANTI-SPOOFING: Exponential Decay ===
+                if use_exponential:
+                    distance_pct = abs(float(px - mid_price)) / float(mid_price) * 100.0
+                    lambda_scaled = self.config.lambda_decay * 100.0
+                    weight = math.exp(-lambda_scaled * distance_pct)
+                    
+                    # Взвешенный объём
+                    relevant_levels[px] = take_qty * weight
+                else:
+                    relevant_levels[px] = take_qty
+                
+                accumulated += take_qty
+            
+            return relevant_levels
+        
+        # 1. Собираем текущие и предыдущие уровни
+        curr_bids = accumulate_volume(self.bids, is_ask=False)
+        curr_asks = accumulate_volume(self.asks, is_ask=True)
+        
+        prev_bids = accumulate_volume(self.previous_bid_snapshot, is_ask=False)
+        prev_asks = accumulate_volume(self.previous_ask_snapshot, is_ask=True)
+        
+        # 2. Рассчитываем OFI: (Bid Inflow - Bid Outflow) - (Ask Inflow - Ask Outflow)
+        
+        # Объединяем все уникальные цены
+        all_bid_prices = set(curr_bids.keys()) | set(prev_bids.keys())
+        all_ask_prices = set(curr_asks.keys()) | set(prev_asks.keys())
+        
+        ofi_bid = sum(
+            curr_bids.get(p, 0.0) - prev_bids.get(p, 0.0)
+            for p in all_bid_prices
+        )
+        
+        ofi_ask = sum(
+            curr_asks.get(p, 0.0) - prev_asks.get(p, 0.0)
+            for p in all_ask_prices
+        )
+        
+        # OFI = Bid Flow - Ask Flow
+        # Positive = Buying pressure dominant
+        return ofi_bid - ofi_ask
 
 
 # ===========================================================================

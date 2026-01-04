@@ -8,6 +8,33 @@ import asyncio  # WHY: Gemini recommendation - Thread Safety для кеша
 import logging  # WHY: Gemini recommendation - Memory Management логирование
 from datetime import datetime, timedelta  # WHY: Для cleanup task
 
+class RegimeAdapter:
+    """Dynamic threshold adjustment based on spread volatility."""
+    
+    @staticmethod
+    def calculate_volatility_factor(
+        current_spread: float,
+        mean_spread: float,
+        std_spread: float
+    ) -> float:
+        """Z-score capped at [0.0, 3.0]."""
+        if std_spread == 0:
+            return 0.0
+        z_score = (current_spread - mean_spread) / std_spread
+        return max(0.0, min(3.0, z_score))
+    
+    @staticmethod
+    def get_dynamic_native_limit(base_ms: float, vol_factor: float) -> float:
+        """Exponential scaling: base * exp(vol/2), capped at 12ms."""
+        import math
+        scaled = base_ms * math.exp(vol_factor / 2)
+        return min(12.0, scaled)
+    
+    @staticmethod
+    def get_dynamic_ratio(base_ratio: float, vol_factor: float) -> float:
+        """Linear reduction: base * (1 - vol/5), floored at 0.10."""
+        scaled = base_ratio * (1 - vol_factor / 5)
+        return max(0.10, scaled)
 
 class IcebergAnalyzer:
     """
@@ -94,8 +121,12 @@ class IcebergAnalyzer:
         """
         WHY: Анализ с учетом временной валидации (Delta-t).
         
-        Различает биржевой refill (5-30ms) от нового ордера маркет-мейкера (50-500ms)
-        на основе математической модели P(Refill|Δt) = 1 / (1 + e^(α(Δt - τ))).
+        === GEMINI FIX: Native vs Synthetic Split ===
+        Теперь использует РАЗНЫЕ пути детекции:
+        - Native (delta_t ≤ 5ms): Детерминированный (confidence=1.0)
+        - Synthetic (5ms < delta_t ≤ 50ms): Стохастический (sigmoid)
+        
+        Теория: Документ "Идентификация айсберг-ордеров", раздел 1.2
         
         Args:
             book: Локальный стакан
@@ -103,36 +134,209 @@ class IcebergAnalyzer:
             visible_before: Видимый объем ДО trade
             delta_t_ms: Время между trade и update (в миллисекундах)
             update_time_ms: Timestamp update события (для логирования)
+            vpin_score: VPIN токсичность потока (опционально)
+            cvd_divergence: CVD дивергенция из AccumulationDetector (опционально)
         
         Returns:
-            IcebergDetectedEvent если найден РЕАЛЬНЫЙ айсберг, иначе None
+            IcebergDetectedEvent если найден айсберг, иначе None
         """
         
-        # --- 1. КОНСТАНТЫ ВРЕМЕННОЙ ВАЛИДАЦИИ ---
-        # WHY: Эмпирические значения для Binance Spot (cite: теор. документ раздел 1.2)
-        MAX_REFILL_DELAY_MS = 50  # Жесткая граница для Public API
-        CUTOFF_MS = 30  # τ_cutoff - точка перехода сигмоиды
-        ALPHA = 0.15  # Коэффициент крутизны (чувствительность модели)
-        MIN_REFILL_PROBABILITY = 0.6  # Минимальная уверенность для классификации
-        
-        # --- 2. ФИЛЬТР ВРЕМЕННОЙ ВАЛИДАЦИИ (КРИТИЧНО) ---
-        
+        # --- 1. ФИЛЬТР RACE CONDITION ---
         # Race condition: update пришел раньше trade (сетевая аномалия)
-        # ЛЮБАЯ отрицательная задержка подозрительна
         if delta_t_ms < 0:
             return None
+
+        if book.spread_mean and book.spread_std:
+            current_spread = float(book.get_spread() or 0)
+            vol_factor = RegimeAdapter.calculate_volatility_factor(
+                current_spread, book.spread_mean, book.spread_std
+            )
+            native_refill_max = RegimeAdapter.get_dynamic_native_limit(
+                self.config.native_refill_max_ms, vol_factor
+            )
+            min_iceberg_ratio = RegimeAdapter.get_dynamic_ratio(
+                self.config.min_iceberg_ratio, vol_factor
+            )
+        else:
+            # Fallback to static config values
+            native_refill_max = self.config.native_refill_max_ms
+            min_iceberg_ratio = self.config.min_iceberg_ratio
         
-        # ЖЕСТКАЯ ГРАНИЦА: Если delta_t > 50ms → точно НЕ refill
-        if delta_t_ms > MAX_REFILL_DELAY_MS:
+        # --- 2. EARLY EXIT PATTERN: РАЗДЕЛЕНИЕ NATIVE vs SYNTHETIC ---
+        # WHY: Используем config для адаптации под токен (BTC/ETH/SOL разные пороги)
+        
+        if delta_t_ms <= self.config.native_refill_max_ms:
+            # NATIVE PATH: Биржевой refill (детерминированный)
+            return self._analyze_native(
+                book=book,
+                trade=trade,
+                visible_before=visible_before,
+                delta_t_ms=delta_t_ms,
+                vpin_score=vpin_score,
+                cvd_divergence=cvd_divergence
+            )
+        
+        elif delta_t_ms <= self.config.synthetic_refill_max_ms:
+            # SYNTHETIC PATH: API бот (стохастический, sigmoid)
+            return self._analyze_synthetic(
+                book=book,
+                trade=trade,
+                visible_before=visible_before,
+                delta_t_ms=delta_t_ms,
+                vpin_score=vpin_score,
+                cvd_divergence=cvd_divergence
+            )
+        
+        else:
+            # TOO SLOW: delta_t > synthetic_max → точно не refill
+            return None
+    
+    def _analyze_native(
+        self,
+        book: LocalOrderBook,
+        trade: TradeEvent,
+        visible_before: Decimal,
+        delta_t_ms: int,
+        vpin_score: Optional[float] = None,
+        cvd_divergence: Optional[dict] = None
+    ) -> Optional[IcebergDetectedEvent]:
+        """
+        WHY: NATIVE PATH - биржевой refill (100μs-10ms).
+        
+        === GEMINI FIX: Детерминированная детекция ===
+        Для Native рефиллов используется confidence=1.0 (без sigmoid).
+        
+        Теория: Биржевой матчинг-движок (Binance Spot) обрабатывает refill
+        детерминированно. Если delta_t ≤ 5ms → это НЕ API roundtrip.
+        
+        Args:
+            book, trade, visible_before: Стандартные параметры
+            delta_t_ms: Уже проверено <= native_refill_max_ms
+            vpin_score, cvd_divergence: Для GEX adjustments
+        
+        Returns:
+            IcebergDetectedEvent или None
+        """
+        # --- ФИЛЬТРЫ ШУМА ---
+        if visible_before < self.config.dust_threshold:
             return None
         
-        # Вычисляем вероятность refill (сигмоида)
-        # P(Refill|Δt) = 1 / (1 + e^(α(Δt - τ)))
+        if trade.quantity <= visible_before:
+            return None
+        
+        hidden_volume = trade.quantity - visible_before
+        
+        if trade.quantity > 0:
+            iceberg_ratio = hidden_volume / trade.quantity
+        else:
+            iceberg_ratio = Decimal("0")
+        
+        # WHY: Проверяем пороги из config
+        if hidden_volume <= self.config.min_hidden_volume or iceberg_ratio <= self.config.min_iceberg_ratio:
+            return None
+        
+        # --- ДЕТЕРМИНИРОВАННАЯ УВЕРЕННОСТЬ (NATIVE) ---
+        # WHY: Native refill = биржевой механизм, НЕ API бот
+        # Confidence = 1.0 (максимальная уверенность)
+        
+        is_ask_iceberg = not trade.is_buyer_maker
+        
+        # Для Native: базовая confidence = 1.0 (детерминированный)
+        base_confidence = 1.0
+        
+        # --- GEX/VPIN ADJUSTMENTS (общий код для Native и Synthetic) ---
+        cvd_tuple = None
+        if cvd_divergence is not None:
+            cvd_tuple = (
+                True,
+                cvd_divergence.get('type', 'BULLISH'),
+                cvd_divergence.get('confidence', 0.0)
+            )
+        
+        dynamic_confidence, is_major_gamma = self.adjust_confidence_by_gamma(
+            base_confidence=base_confidence,
+            gamma_profile=book.gamma_profile,
+            price=trade.price,
+            is_ask=is_ask_iceberg,
+            vpin_score=vpin_score,
+            cvd_divergence=cvd_tuple
+        )
+        
+        if is_major_gamma:
+            print(f"🌊 [NATIVE GAMMA] Айсберг на MAJOR GAMMA LEVEL @ {trade.price}")
+        
+        # --- РЕГИСТРАЦИЯ В РЕЕСТРЕ ---
+        iceberg_lvl = book.register_iceberg(
+            price=trade.price,
+            hidden_vol=hidden_volume,
+            is_ask=is_ask_iceberg,
+            confidence=dynamic_confidence
+        )
+        iceberg_lvl.refill_count += 1
+        
+        return IcebergDetectedEvent(
+            symbol=book.symbol,
+            price=trade.price,
+            detected_hidden_volume=hidden_volume,
+            visible_volume_before=visible_before,
+            confidence=dynamic_confidence
+        )
+    
+    def _analyze_synthetic(
+        self,
+        book: LocalOrderBook,
+        trade: TradeEvent,
+        visible_before: Decimal,
+        delta_t_ms: int,
+        vpin_score: Optional[float] = None,
+        cvd_divergence: Optional[dict] = None
+    ) -> Optional[IcebergDetectedEvent]:
+        """
+        WHY: SYNTHETIC PATH - API бот (10ms-50ms).
+        
+        === GEMINI FIX: Стохастическая детекция ===
+        Для Synthetic используется sigmoid для вероятности refill.
+        
+        Теория: API боты имеют network latency (10-50ms).
+        Sigmoid модель: P(Refill|Δt) = 1 / (1 + e^(α(Δt - τ)))
+        
+        Args:
+            book, trade, visible_before: Стандартные параметры
+            delta_t_ms: Уже проверено: native_max < delta_t <= synthetic_max
+            vpin_score, cvd_divergence: Для GEX adjustments
+        
+        Returns:
+            IcebergDetectedEvent или None
+        """
+        # --- ФИЛЬТРЫ ШУМА ---
+        if visible_before < self.config.dust_threshold:
+            return None
+        
+        if trade.quantity <= visible_before:
+            return None
+        
+        hidden_volume = trade.quantity - visible_before
+        
+        if trade.quantity > 0:
+            iceberg_ratio = hidden_volume / trade.quantity
+        else:
+            iceberg_ratio = Decimal("0")
+        
+        if hidden_volume <= self.config.min_hidden_volume or iceberg_ratio <= self.config.min_iceberg_ratio:
+            return None
+        
+        # --- СТОХАСТИЧЕСКАЯ УВЕРЕННОСТЬ (SYNTHETIC) ---
+        # WHY: Используем sigmoid для вычисления P(Refill|Δt)
+        
         from math import exp
+        
+        # Параметры из config (адаптированы под токен)
+        CUTOFF_MS = self.config.synthetic_cutoff_ms  # τ (точка P=0.5)
+        ALPHA = self.config.synthetic_probability_decay  # α (крутизна)
         
         exponent = ALPHA * (delta_t_ms - CUTOFF_MS)
         
-        # Защита от overflow (важно для стабильности)
+        # Защита от overflow
         if exponent > 50:
             refill_probability = 0.0
         elif exponent < -50:
@@ -140,91 +344,56 @@ class IcebergAnalyzer:
         else:
             refill_probability = 1.0 / (1.0 + exp(exponent))
         
-        # МЯГКАЯ ГРАНИЦА: Если вероятность < 0.6 → недостаточно уверенности
-        if refill_probability < MIN_REFILL_PROBABILITY:
+        # WHY: Для Synthetic минимальная вероятность = 0.2 (20%)
+        # Если меньше - слишком неуверенны
+        if refill_probability < 0.2:
             return None
         
-        # --- 3. ОСТАЛЬНЫЕ ФИЛЬТРЫ (ИЗ БАЗОВОГО МЕТОДА) ---
+        is_ask_iceberg = not trade.is_buyer_maker
         
-        # WHY: Фильтр "пыли" из config (для ETH/SOL пороги другие)
-        if visible_before < self.config.dust_threshold:
-            return None
+        # Базовая уверенность от объема
+        volume_confidence = float(min(iceberg_ratio, Decimal("0.95")))
         
-        # Если сделка меньше видимого объема -> скрытой части точно не было
-        if trade.quantity <= visible_before:
-            return None
+        # Для Synthetic: base = volume * timing
+        base_confidence = volume_confidence * refill_probability
         
-        hidden_volume = trade.quantity - visible_before
-        
-        # Рассчитываем соотношение скрытого объема к размеру сделки
-        if trade.quantity > 0:
-            iceberg_ratio = hidden_volume / trade.quantity
-        else:
-            iceberg_ratio = Decimal("0")
-        
-        # WHY: Пороги из config (для ETH = 1.0, для SOL = 10.0)
-        if hidden_volume > self.config.min_hidden_volume and iceberg_ratio > self.config.min_iceberg_ratio:
-            
-            # Определяем направление
-            is_ask_iceberg = not trade.is_buyer_maker
-            
-            # --- 4. МОДИФИЦИРОВАННАЯ УВЕРЕННОСТЬ (УЧИТЫВАЕМ DELTA-T) ---
-            # WHY: Объединяем уверенность от объема И от времени
-            
-            # Базовая уверенность от объема (как в старом методе)
-            volume_confidence = float(min(iceberg_ratio, Decimal("0.95")))
-            
-            # Базовая уверенность = volume_confidence * timing_confidence
-            # Пример: volume=0.8, timing=0.9 → base=0.72
-            base_confidence = volume_confidence * refill_probability
-            
-            # === НОВОЕ: GEX-ADJUSTMENT ===
-            # Модифицируем уверенность на основе Gamma Exposure + VPIN + CVD
-            # WHY: vpin_score и cvd_divergence приходят из services.py (контекст торговли)
-            
-            # Преобразуем cvd_divergence из dict в tuple для adjust_confidence_by_gamma
-            cvd_tuple = None
-            if cvd_divergence is not None:
-                # cvd_divergence = {'type': 'BULLISH'/'BEARISH', 'confidence': float, ...}
-                cvd_tuple = (
-                    True,  # is_divergence
-                    cvd_divergence.get('type', 'BULLISH'),  # div_type
-                    cvd_divergence.get('confidence', 0.0)   # confidence
-                )
-            
-            dynamic_confidence, is_major_gamma = self.adjust_confidence_by_gamma(
-                base_confidence=base_confidence,
-                gamma_profile=book.gamma_profile,
-                price=trade.price,
-                is_ask=is_ask_iceberg,
-                vpin_score=vpin_score,        # Передано из services.py
-                cvd_divergence=cvd_tuple      # Преобразовано из dict -> tuple
-            )
-            
-            # Если это major gamma event - логируем
-            if is_major_gamma:
-                print(f"🌊 [GAMMA ALERT] Айсберг на MAJOR GAMMA LEVEL @ {trade.price}")
-            
-            # --- 5. РЕГИСТРАЦИЯ В РЕЕСТРЕ ---
-            iceberg_lvl = book.register_iceberg(
-                price=trade.price,
-                hidden_vol=hidden_volume,
-                is_ask=is_ask_iceberg,
-                confidence=dynamic_confidence
-            )
-            
-            # Инкрементируем счетчик рефиллов
-            iceberg_lvl.refill_count += 1
-            
-            return IcebergDetectedEvent(
-                symbol=book.symbol,
-                price=trade.price,
-                detected_hidden_volume=hidden_volume,
-                visible_volume_before=visible_before,
-                confidence=dynamic_confidence  # Уже учитывает GEX-adjustment
+        # --- GEX/VPIN ADJUSTMENTS (общий код) ---
+        cvd_tuple = None
+        if cvd_divergence is not None:
+            cvd_tuple = (
+                True,
+                cvd_divergence.get('type', 'BULLISH'),
+                cvd_divergence.get('confidence', 0.0)
             )
         
-        return None
+        dynamic_confidence, is_major_gamma = self.adjust_confidence_by_gamma(
+            base_confidence=base_confidence,
+            gamma_profile=book.gamma_profile,
+            price=trade.price,
+            is_ask=is_ask_iceberg,
+            vpin_score=vpin_score,
+            cvd_divergence=cvd_tuple
+        )
+        
+        if is_major_gamma:
+            print(f"🌊 [SYNTHETIC GAMMA] Айсберг на MAJOR GAMMA LEVEL @ {trade.price}")
+        
+        # --- РЕГИСТРАЦИЯ В РЕЕСТРЕ ---
+        iceberg_lvl = book.register_iceberg(
+            price=trade.price,
+            hidden_vol=hidden_volume,
+            is_ask=is_ask_iceberg,
+            confidence=dynamic_confidence
+        )
+        iceberg_lvl.refill_count += 1
+        
+        return IcebergDetectedEvent(
+            symbol=book.symbol,
+            price=trade.price,
+            detected_hidden_volume=hidden_volume,
+            visible_volume_before=visible_before,
+            confidence=dynamic_confidence
+        )
 
     def adjust_confidence_by_gamma(
         self,
@@ -287,14 +456,18 @@ class IcebergAnalyzer:
         
         # === ФАЗА 1: GEX ADJUSTMENT (GEMINI FIX: Normalization) ===
         if gamma_profile is not None:
-            # 1. Проверяем близость к Gamma Walls
-            price_float = float(price)
-            # WHY: Используем процентный толеранс из config (адаптируется к цене)
-            TOLERANCE = price_float * float(self.config.gamma_wall_tolerance_pct)
+            # FIX VULNERABILITY #4: Decimal-safe comparison
+            # WHY: price уже Decimal, gamma_profile.call/put_wall теперь тоже Decimal
+            # НЕ конвертируем в float - сравниваем Decimal с Decimal!
             
-            # 2. Определяем, стоим ли мы на стене
-            on_call_wall = abs(price_float - gamma_profile.call_wall) < TOLERANCE
-            on_put_wall = abs(price_float - gamma_profile.put_wall) < TOLERANCE
+            # 1. Вычисляем tolerance как Decimal
+            # WHY: Используем процентный толеранс из config (адаптируется к цене)
+            tolerance_pct = Decimal(str(self.config.gamma_wall_tolerance_pct))
+            TOLERANCE = price * tolerance_pct
+            
+            # 2. Определяем, стоим ли мы на стене (Decimal comparison)
+            on_call_wall = abs(price - gamma_profile.call_wall) < TOLERANCE
+            on_put_wall = abs(price - gamma_profile.put_wall) < TOLERANCE
             
             is_on_gamma_wall = on_call_wall or on_put_wall
             
@@ -881,6 +1054,9 @@ class SpoofingAnalyzer:
     """
     WHY: Многоуровневая система детекции спуфинга.
     
+    === GEMINI FIX: Мульти-токен поддержка ===
+    Больше не использует @staticmethod. Использует config для адаптации порогов.
+    
     Использует временной, поведенческий и статистический анализ для определения
     вероятности того, что айсберг является манипуляцией (спуфингом).
     
@@ -896,8 +1072,17 @@ class SpoofingAnalyzer:
     WEIGHT_CANCELLATION = 0.5
     WEIGHT_EXECUTION = 0.2
     
-    @staticmethod
+    def __init__(self, config: AssetConfig):
+        """
+        WHY: GEMINI FIX - Инициализация с конфигурацией актива.
+        
+        Args:
+            config: AssetConfig (BTC_CONFIG, ETH_CONFIG, SOL_CONFIG)
+        """
+        self.config = config
+    
     def calculate_spoofing_probability(
+        self,
         iceberg_level: IcebergLevel,
         current_mid_price: Decimal,
         price_history: List[Decimal]  # Последние 10 секунд
@@ -920,15 +1105,15 @@ class SpoofingAnalyzer:
         """
         
         # 1. Временной анализ (30%)
-        duration_score = SpoofingAnalyzer._analyze_duration(iceberg_level)
+        duration_score = self._analyze_duration(iceberg_level)
         
         # 2. Анализ контекста отмены (50%)
-        cancellation_score = SpoofingAnalyzer._analyze_cancellation_context(
+        cancellation_score = self._analyze_cancellation_context(
             iceberg_level, current_mid_price, price_history
         )
         
         # 3. Анализ паттерна исполнения (20%)
-        execution_score = SpoofingAnalyzer._analyze_execution_pattern(iceberg_level)
+        execution_score = self._analyze_execution_pattern(iceberg_level)
         
         # Взвешенная сумма
         total_score = (
@@ -940,35 +1125,39 @@ class SpoofingAnalyzer:
         # Обрезаем до [0.0, 1.0]
         return max(0.0, min(1.0, total_score))
     
-    @staticmethod
-    def _analyze_duration(iceberg_level: IcebergLevel) -> float:
+    def _analyze_duration(self, iceberg_level: IcebergLevel) -> float:
         """
         WHY: Короткоживущие айсберги (<5 сек) - это почти всегда спуфинг
         
+        === GEMINI FIX: Гладкая функция ===
+        Вместо ступенчатой логики используется логарифмическое затухание.
+        
         Логика:
-        - T_life < 5 секунд  → score = 1.0 (100% спуфинг)
-        - T_life < 60 секунд → score = 0.7 (вероятно HFT)
-        - T_life < 300 секунд → score = 0.3 (краткосрочный алго)
-        - T_life >= 300 секунд → score = 0.0 (свинг-уровень)
+        - Формула: score = 1.0 / (1.0 + 0.1 * duration_seconds)
+        - Примеры:
+          - 4.9 сек → 0.67
+          - 5.1 сек → 0.66
+          - 60 сек → 0.14
+          - 300 сек → 0.03
         
         Returns:
-            Score от 0.0 до 1.0
+            Score от 0.0 до 1.0 (плавное затухание)
         """
         from datetime import datetime
         
         lifetime_seconds = (datetime.now() - iceberg_level.creation_time).total_seconds()
         
-        if lifetime_seconds < 5:
-            return 1.0  # Гарантированно спуфинг
-        elif lifetime_seconds < 60:
-            return 0.7  # Вероятно HFT-манипуляция
-        elif lifetime_seconds < 300:
-            return 0.3  # Краткосрочный алго (может быть легитимным)
-        else:
-            return 0.0  # Долгоживущий = реальный уровень
+        # === GEMINI FIX: Гладкая функция (логарифмическое затухание) ===
+        # Преимущества:
+        # - ML-friendly: Нет резких скачков (4.9→0.67, 5.1→0.66)
+        # - Быстрое затухание: 60 сек → 0.14 (HFT фильтруется)
+        # - Асимптота к 0: 300+ сек → ~0.03 (реальный уровень)
+        score = 1.0 / (1.0 + 0.1 * lifetime_seconds)
+        
+        return score
     
-    @staticmethod
     def _analyze_cancellation_context(
+        self,
         iceberg_level: IcebergLevel,
         current_mid_price: Decimal,
         price_history: List[Decimal]
@@ -976,13 +1165,16 @@ class SpoofingAnalyzer:
         """
         WHY: Отмена при приближении цены - главный признак спуфинга
         
+        === GEMINI FIX: Динамический порог близости ===
+        Вместо хардкода 0.5% используется config.spoofing_distance_pct.
+        
         Спуфер ставит fake wall, чтобы запугать других трейдеров.
         Когда цена начинает двигаться К этому уровню → он отменяет.
         
         Логика:
         - Нет контекста отмены → score = 0.0 (не можем судить)
         - moving_towards_level = True → score += 0.6
-        - distance < 0.5% → score += 0.3
+        - distance < config.spoofing_distance_pct → score += 0.3
         - volume_executed < 10% → score += 0.1
         
         Returns:
@@ -1000,8 +1192,12 @@ class SpoofingAnalyzer:
         if ctx.moving_towards_level:
             score += 0.6
         
+        # === GEMINI FIX: Динамический порог ===
         # КРИТЕРИЙ 2: Цена была близко к уровню (+0.3)
-        if abs(float(ctx.distance_from_level_pct)) < 0.5:  # Меньше 0.5%
+        # Вместо хардкода 0.5% используем config
+        # BTC: 0.5%, ETH: 1.0%, SOL: 2.0%
+        distance_threshold_pct = float(self.config.spoofing_distance_pct) * 100  # Переводим в %
+        if abs(float(ctx.distance_from_level_pct)) < distance_threshold_pct:
             score += 0.3
         
         # КРИТЕРИЙ 3: Исполнено очень мало (+0.1)
@@ -1018,15 +1214,17 @@ class SpoofingAnalyzer:
         
         return max(0.0, min(1.0, score))
     
-    @staticmethod
-    def _analyze_execution_pattern(iceberg_level: IcebergLevel) -> float:
+    def _analyze_execution_pattern(self, iceberg_level: IcebergLevel) -> float:
         """
         WHY: Реальные айсберги активно исполняются, спуфинг - нет
+        
+        === GEMINI FIX: Мульти-токен поддержка ===
+        Вместо хардкода 0.1 BTC используется config.spoofing_volume_threshold.
         
         Логика:
         - refill_frequency > 10/мин → score = 0.0 (агрессивный алго, легит)
         - refill_frequency < 1/мин → score = 0.5 (подозрительно мало активности)
-        - total_hidden_volume очень маленький → score += 0.3
+        - total_hidden_volume < config.spoofing_volume_threshold → score += 0.3
         
         Returns:
             Score от 0.0 до 1.0
@@ -1044,8 +1242,11 @@ class SpoofingAnalyzer:
             # Линейная интерполяция между 1 и 10
             score = 0.5 * (1.0 - (refill_freq - 1.0) / 9.0)
         
+        # === GEMINI FIX: Мульти-токен порог ===
         # КРИТЕРИЙ 2: Очень маленький общий объем (+0.3)
-        if float(iceberg_level.total_hidden_volume) < 0.1:  # < 0.1 BTC
+        # Вместо хардкода 0.1 BTC используем config
+        # BTC: 0.1, ETH: 2.0, SOL: 20.0
+        if float(iceberg_level.total_hidden_volume) < float(self.config.spoofing_volume_threshold):
             score += 0.3
         
         return min(1.0, score)
@@ -1773,9 +1974,14 @@ class GammaProvider:
         except:
             return None
     
-    def get_gamma_wall_distance(self, current_price: float) -> Tuple[Optional[float], Optional[str]]:
+    def get_gamma_wall_distance(self, current_price: Decimal) -> Tuple[Optional[float], Optional[str]]:
         """
         WHY: Рассчитывает расстояние до ближайшей gamma wall.
+        
+        FIX VULNERABILITY #4: Decimal-safe distance calculation
+        - current_price: Decimal (вместо float)
+        - gamma_profile.call/put_wall: Decimal (после fix)
+        - Расстояние вычисляется в Decimal, конвертируется в float только для return
         
         Теория (документ "Анализ данных смарт-мани"):
         - Gamma Wall = страйк с максимальной концентрацией гаммы
@@ -1783,11 +1989,11 @@ class GammaProvider:
         - Put Wall = поддержка (дилеры покупают на падении)
         
         Args:
-            current_price: Текущая цена актива
+            current_price: Текущая цена актива (Decimal)
         
         Returns:
             Tuple[distance_pct, wall_type]:
-            - distance_pct: Процентное расстояние до ближайшей wall
+            - distance_pct: Процентное расстояние до ближайшей wall (float для DB)
             - wall_type: 'CALL' | 'PUT' | None
         """
         if not self.book or not self.book.gamma_profile:
@@ -1796,11 +2002,12 @@ class GammaProvider:
         try:
             gamma_profile = self.book.gamma_profile
             
-            # Расстояния до стен
+            # FIX: Decimal-safe distance calculation
+            # Расстояния до стен (Decimal - Decimal = Decimal)
             dist_to_call = abs(current_price - gamma_profile.call_wall)
             dist_to_put = abs(current_price - gamma_profile.put_wall)
             
-            # Находим ближайшую
+            # Находим ближайшую (Decimal comparison)
             if dist_to_call < dist_to_put:
                 closest_wall = gamma_profile.call_wall
                 wall_type = 'CALL'
@@ -1810,9 +2017,10 @@ class GammaProvider:
                 wall_type = 'PUT'
                 distance = dist_to_put
             
-            # Процентное расстояние
-            distance_pct = (distance / current_price) * 100
+            # Процентное расстояние (Decimal arithmetic)
+            distance_pct = (distance / current_price) * Decimal("100")
             
+            # Конвертируем в float ТОЛЬКО для return (для записи в DB)
             return float(distance_pct), wall_type
             
         except:

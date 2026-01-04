@@ -145,30 +145,42 @@ class ReorderingBuffer:
 
     def pop_ready(self) -> List[Any]:
         """
-        Возвращает список событий, которые "созрели" (старше чем delay).
+        FIX VULNERABILITY #3: Ghost Trade Issue
+        
+        Возвращает ТОЛЬКО события старше delay_sec (time-window filtering).
+        
+        WHY: Гарантирует что Trade и Depth обрабатываются ВМЕСТЕ:
+        - Trade приходит T=0ms
+        - Depth приходит T+30ms
+        - delay_sec=0.05 (50ms)
+        - pop_ready() на T=60ms вернет ОБА события
+        
+        КРИТИЧНО: События НЕ удаляются если они моложе delay_sec!
+        Это позволяет собрать "пакет" связанных событий.
+        
+        Returns:
+            List событий старше delay_sec, отсортированных по (event_time, priority)
         """
-        now = time.time() # Текущее локальное время
-        # В реальной HFT системе здесь используют arrival_time, 
-        # но для Python и Binance event_time более надежен для сортировки.
+        now = time.time()  # Текущее локальное время в секундах
+        cutoff_time = now - self.delay_sec  # Граница "созревания"
         
         ready_items = []
         
-        # Смотрим на самый старый элемент в куче (без удаления)
+        # Извлекаем события старше cutoff_time
         while self.buffer:
-            event_time, priority, item = self.buffer[0]
+            # Проверяем самый старый элемент (не удаляя)
+            event_time, priority, counter, item = self.buffer[0]
             
-            # Эвристика: Мы ждем, пока "виртуальное время" события не отстанет от реального на delay.
-            # Но так как event_time - это время биржи, а now - наше, они рассинхронены.
-            # Упрощенный подход для MVP:
-            # Мы просто накапливаем буфер. В реальном asyncio loop мы будем вызывать pop 
-            # с задержкой. Здесь мы вернем всё, что есть, полагаясь на то, 
-            # что потребитель вызывает нас с паузой.
-            
-            # ПРАВИЛЬНЫЙ ПОДХОД ДЛЯ ASYNCIO:
-            # Мы просто сортируем всё что есть. Логика ожидания будет в services.py
-            break 
-            
-        return []
+            # Если событие старше cutoff → извлекаем
+            if event_time <= cutoff_time:
+                heappop(self.buffer)  # Удаляем из буфера
+                ready_items.append(item)
+            else:
+                # Событие слишком свежее → прерываем цикл
+                # (heap отсортирован, все остальные тоже свежие)
+                break
+        
+        return ready_items
 
     def get_all_sorted(self):
         """

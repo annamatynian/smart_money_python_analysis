@@ -202,11 +202,17 @@ class DerivativesAnalyzer:
         # Используем статический метод GammaProfile для расчёта expiry
         expiry_timestamp = GammaProfile.get_next_options_expiry()
         
+        # === FIX VULNERABILITY #4: Convert float → Decimal ===
+        # WHY: GammaProfile.call_wall/put_wall теперь Decimal (точность цен)
+        # Страйки приходят как float из Deribit API → конвертируем в Decimal
+        call_wall_decimal = Decimal(str(call_wall)) if call_wall else Decimal("0")
+        put_wall_decimal = Decimal(str(put_wall)) if put_wall else Decimal("0")
+        
         return GammaProfile(
             total_gex=total_gex,
             total_gex_normalized=total_gex_normalized,  # NEW
-            call_wall=call_wall if call_wall else 0.0,
-            put_wall=put_wall if put_wall else 0.0,
+            call_wall=call_wall_decimal,  # FIX: Decimal вместо float
+            put_wall=put_wall_decimal,    # FIX: Decimal вместо float
             expiry_timestamp=expiry_timestamp  # NEW
         )
     
